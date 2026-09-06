@@ -92,6 +92,14 @@ module OSXSpeechBridge
       false
     end
 
+    def prepare_text(text)
+      # Apple speech can hang on angle brackets even in plain-text utterances.
+      text.to_s.encode("UTF-8", invalid: :replace, undef: :replace).gsub(/[<>]/) do |character|
+        name = character == "<" ? p_("EAPI_Speech", "less") : p_("EAPI_Speech", "greater")
+        " #{name} "
+      end
+    end
+
     def start(synth, text, track_indexes: true)
       return false if synth.to_i == 0
       reset_index_events(synth) if track_indexes
@@ -160,6 +168,7 @@ module OSXSpeechBridge
 
     def render_to_stream(voice_id, text, rate, volume)
       raise RuntimeError, "AVFoundation speech synthesis is unavailable" unless stream_available?
+      text = prepare_text(text)
       mutex = Mutex.new
       condition = ConditionVariable.new
       state = {
@@ -413,7 +422,7 @@ module OSXSpeechBridge
     end
 
     def build_utterance(text, voice_id, rate, volume)
-      utterance = send_id(cls("AVSpeechUtterance"), "speechUtteranceWithString:", nsstring(text.to_s), [PTR])
+      utterance = send_id(cls("AVSpeechUtterance"), "speechUtteranceWithString:", nsstring(prepare_text(text)), [PTR])
       if voice_id.to_s != ""
         voice = send_id(cls("AVSpeechSynthesisVoice"), "voiceWithIdentifier:", nsstring(voice_id.to_s), [PTR])
         send_void(utterance, "setVoice:", voice, [PTR]) if voice.to_i != 0
@@ -837,7 +846,7 @@ class OSXSpeech < SpeechOutput
       speech = +""
       offset = 0
       texts.each_with_index do |text, index|
-        text = text.to_s
+        text = OSXSpeechBridge.prepare_text(text)
         @indexed_offsets << [offset, bookmark_for(indexes[index], id)]
         speech << text
         offset += speech_character_length(text)
