@@ -210,18 +210,14 @@ module EltenAPI
         @cancelled = false
         @content = nil
         @last_spoken_at = nil
-        dialog_open
+        @owns_waiting = false
+        modal_interaction_open
         @opened = true
-        type = EltenAPI::Controls::EditBox::Flags::MultiLine | EltenAPI::Controls::EditBox::Flags::ReadOnly
-        @info = EltenAPI::Controls::EditBox.new(title.to_s, type: type, text: _("Please wait..."), quiet: true)
-        fields = [@info]
-        if @cancellable
-          @cancel = EltenAPI::Controls::Button.new(_("Cancel"))
-          @cancel.on(:press) { @cancelled = true }
-          fields << @cancel
+        unless waiting_opened
+          @owns_waiting = true
+          waiting
         end
-        @form = EltenAPI::Controls::Form.new(fields, index: 0, silent: false, quiet: false)
-        @form.cancel_button = @cancel if @cancel != nil
+        speak([title.to_s, _("Please wait...")].reject { |part| part == "" }.uniq.join("\n"))
       rescue Exception
         close
         raise
@@ -231,7 +227,6 @@ module EltenAPI
         content = content.to_s
         return if content == @content
         @content = content
-        @info.set_text(content, false)
         now = monotonic_time
         if content != "" && (@last_spoken_at == nil || now - @last_spoken_at >= 1.0 || content.match?(/(?:\A|\n)100(?:\.0)?%\z/))
           speak(content)
@@ -241,7 +236,7 @@ module EltenAPI
 
       def tick
         loop_update
-        @form.update
+        @cancelled = true if @cancellable && key_pressed?(:key_escape)
       end
 
       def cancelled?
@@ -254,9 +249,13 @@ module EltenAPI
 
       def close
         return if @opened != true
-        dialog_close
-      ensure
         @opened = false
+        begin
+          waiting_end if @owns_waiting
+        ensure
+          @owns_waiting = false
+          modal_interaction_close
+        end
       end
 
       private
