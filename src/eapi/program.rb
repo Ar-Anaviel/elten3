@@ -3717,7 +3717,7 @@ class Program
 
   def communication
     @communication = nil if @communication != nil && @communication.closed?
-    @communication ||= manage(EltenAPI::Communication::Endpoint.new(app_id: app_uuid))
+    @communication ||= manage(EltenAPI::Communication::Endpoint.new(app_id: app_uuid, context: self))
   end
 
   def live_sessions
