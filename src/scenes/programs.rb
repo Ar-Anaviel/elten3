@@ -92,6 +92,16 @@ when 1
            }
          end
        }
+       program_class=program_scene_class(program)
+       if program_class!=nil
+         menu.option(p_("Programs", "Add this program to quick actions"), nil, "q") {
+           if QuickActions.create(program_class, program.name.to_s+" (#{p_("Programs", "Program")})")
+             alert(p_("Programs", "Program added to quick actions"), false)
+           else
+             alert(_("Error"))
+           end
+         }
+       end
        add_install_options(menu)
      end
 
@@ -729,6 +739,12 @@ when 1
      def program_uuid(program)
        return "" if program==nil || !program.respond_to?(:id)
        program.id.to_s.downcase
+     end
+
+     def program_scene_class(program)
+       uuid=program_uuid(program)
+       return nil if uuid==""
+       Programs.list.find{|cls| cls.respond_to?(:app_uuid) && cls.app_uuid.to_s.downcase==uuid}
      end
 
      def same_program?(a,b)
