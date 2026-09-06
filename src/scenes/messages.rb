@@ -240,8 +240,8 @@ else
     EltenLink::Messages.mark_all_read(elten_link, user: @users[@sel_users.index].user)
   rescue EltenLink::Error
     alert(_("Error"))
-    $scene = Scene_Main.new
-    return
+    @sel_users.focus
+    next
     end
     alert(p_("Messages", "All messages in this conversation have been marked as read."))
 speech_wait
@@ -322,8 +322,8 @@ confirm(p_("messages", "Are you sure you want to mark all messages in all conver
     EltenLink::Messages.mark_all_read(elten_link)
   rescue EltenLink::Error
     alert(_("Error"))
-    $scene = Scene_Main.new
-    return
+    @sel_users.focus
+    next
     end
     alert(p_("Messages", "All messages have been marked as read."))
 speech_wait
