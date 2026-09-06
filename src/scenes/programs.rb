@@ -93,7 +93,7 @@ when 1
          end
        }
        program_class=program_scene_class(program)
-       if program_class!=nil
+       if program_class!=nil && !program_class.hidden?
          menu.option(p_("Programs", "Add this program to quick actions"), nil, "q") {
            if QuickActions.create(program_class, program.name.to_s+" (#{p_("Programs", "Program")})")
              alert(p_("Programs", "Program added to quick actions"), false)
