@@ -169,6 +169,7 @@ module EltenAPI
         @stream_responses = Queue.new
         @stream_controls = Queue.new
         @notification_ids = {}
+        @notifications_primed = false
         @active_notifications_mutex = Mutex.new
         @runtime_state_mutex = Mutex.new
         @active_notifications = []
@@ -315,6 +316,7 @@ module EltenAPI
         @virtual_update_request_pending = false
         @next_virtual_update_check_at = 0.0
         @notification_ids.clear
+        @notifications_primed = false
         @active_notifications_mutex.synchronize do
           @active_notifications = []
           @active_notifications_hash = ""
@@ -746,8 +748,8 @@ module EltenAPI
         EltenAPI::LiveSessions.receive(response["live_sessions"]) if defined?(EltenAPI::LiveSessions)
         handle_premium_packages(response)
         handle_call(response, key)
-        if calibrating == true
-          prime_window_notifications(response)
+        if @notifications_primed != true
+          @notifications_primed = prime_window_notifications(response)
         else
           handle_window_notifications(response)
         end
@@ -904,13 +906,14 @@ module EltenAPI
       end
 
       def prime_window_notifications(response)
-        notifications = response["wn"]
-        return if !notifications.is_a?(Array)
-        notifications.each do |notification|
+        batches = [response["wn"], response["notifications_state"]].select { |rows| rows.is_a?(Array) }
+        return false if batches.empty?
+        batches.flatten(1).each do |notification|
           id = notification["id"]
           next if id == nil || id == ""
           remember_notification(id)
         end
+        true
       end
 
       def fetch_feeds(key, feed: nil, feedtime: nil)
