@@ -55,7 +55,7 @@ module EltenPath
     return extension unless extension.empty?
 
     name = File.basename(value)
-    name.match?(/\A\.[^.]+\z/) ? name : ""
+    name[/\A\.*(\.[^.]+)\z/, 1] || ""
   end
 
   def relative_from(path, root)
