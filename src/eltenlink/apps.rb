@@ -214,7 +214,15 @@ module EltenLink
         @table = table.to_s
       end
 
-      def select(where: nil, order: nil, limit: nil, offset: nil)
+      def select(where: nil, order: nil, limit: nil, offset: nil, columns: nil, distinct: nil,
+        group_by: nil, aggregates: nil, joins: nil, include_access: nil)
+        extended = {
+          columns: columns, distinct: distinct, group_by: group_by, aggregates: aggregates,
+          joins: joins, include_access: include_access
+        }.reject { |_key, value| value.nil? }
+        unless extended.empty?
+          return query(where: where, order: order, limit: limit, offset: offset, **extended)
+        end
         params = Apps.stamp_params
         params["where"] = JSON.generate(where) if where != nil
         params["order"] = JSON.generate(order) if order != nil
@@ -244,7 +252,82 @@ module EltenLink
         true
       end
 
+      # Extended queries are JSON POSTs. Plain select keeps the original GET
+      # request and response, including compatibility with older servers.
+      def query(where: nil, order: nil, limit: nil, offset: nil, columns: nil, distinct: nil,
+        group_by: nil, aggregates: nil, joins: nil, include_access: nil)
+        options = {
+          "where" => where, "order" => order, "limit" => limit, "offset" => offset,
+          "columns" => columns, "distinct" => distinct, "group_by" => group_by,
+          "aggregates" => aggregates, "joins" => joins, "include_access" => include_access
+        }.reject { |_key, value| value.nil? }
+        data = @client.api_data("POST", "#{path}/query", Apps.stamp_params.merge(options))
+        data["rows"].to_a
+      end
+
+      def insert_many(values)
+        bulk("insert", "values" => values)["rows"].to_a
+      end
+
+      def upsert_many(values)
+        bulk("upsert", "values" => values)["rows"].to_a
+      end
+
+      def delete_many(ids)
+        bulk("delete", "ids" => ids)["count"].to_i
+      end
+
+      def share_many(ids, users: nil, contacts: false)
+        bulk("share", "ids" => ids, "targets" => share_targets(users, contacts))["count"].to_i
+      end
+
+      def unshare_many(ids, users: nil, contacts: false)
+        bulk("unshare", "ids" => ids, "targets" => share_targets(users, contacts))["count"].to_i
+      end
+
+      def share(id, user: nil, contacts: false)
+        raise ArgumentError, "Specify either user or contacts" if contacts && !user.nil?
+        params = Apps.stamp_params
+        if contacts
+          params["contacts"] = true
+        else
+          raise ArgumentError, "A user is required" if user.to_s.strip.empty?
+          params["shared_with"] = user.to_s
+        end
+        data = @client.api_data("POST", "#{path}/#{share_row_id(id)}/shares", params)
+        data["share"]
+      end
+
+      # Omitting user preserves the server's self-unshare operation. Contacts
+      # policies can only be removed by the creator of the row.
+      def unshare(id, user: nil, contacts: false)
+        raise ArgumentError, "Specify either user or contacts" if contacts && !user.nil?
+        params = Apps.stamp_params
+        params["contacts"] = true if contacts
+        request_path = "#{path}/#{share_row_id(id)}/shares"
+        request_path += "/#{Apps.query_escape(user.to_s)}" unless user.nil?
+        @client.api_data("DELETE", request_path, params)
+        true
+      end
+
       private
+
+      def bulk(operation, params)
+        @client.api_data("POST", "#{path}/bulk", Apps.stamp_params.merge(params).merge("operation" => operation))
+      end
+
+      def share_targets(users, contacts)
+        raise ArgumentError, "Users must be an array" unless users.nil? || users.is_a?(Array)
+        targets = (users || []).map { |user| { "type" => "user", "user" => user.to_s } }
+        targets << { "type" => "contacts" } if contacts
+        raise ArgumentError, "At least one sharing target is required" if targets.empty?
+        targets
+      end
+
+      def share_row_id(id)
+        raise ArgumentError, "Invalid app table row ID" unless id.to_s.match?(/\A[1-9]\d*\z/)
+        id.to_i
+      end
 
       def path
         "/api/v1/apps/#{Apps.query_escape(@app_uuid)}/tables/#{Apps.query_escape(@table)}/rows"
