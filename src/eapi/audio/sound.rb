@@ -6,6 +6,48 @@
 
 require "weakref"
 
+class OutputAudioDevice
+  attr_reader :id, :name, :driver
+
+  def initialize(id:, name:, driver:, flags:)
+    @id = Integer(id)
+    @name = name.to_s.dup.freeze
+    @driver = driver.to_s.dup.freeze
+    @flags = Integer(flags)
+    freeze
+  end
+
+  def enabled?
+    (@flags & 1) != 0
+  end
+
+  def disabled?
+    !enabled?
+  end
+
+  def default?
+    (@flags & 2) != 0
+  end
+
+  def initialized?
+    (@flags & 4) != 0
+  end
+
+  def to_s
+    @name
+  end
+
+  def ==(other)
+    other.is_a?(OutputAudioDevice) && @id == other.id && @driver == other.driver
+  end
+
+  alias eql? ==
+
+  def hash
+    [@id, @driver].hash
+  end
+end
+
 class SoundStatus
   attr_reader :name, :bass_code
 
@@ -607,7 +649,7 @@ class SoundEffect
 end
 
 class Sound
-  attr_reader :file, :channel, :source_channel, :sample_handle, :kind, :basefrequency, :effects, :effect_buffer, :effect_buffer_seconds, :spatial_effect
+  attr_reader :output_device, :file, :channel, :source_channel, :sample_handle, :kind, :basefrequency, :effects, :effect_buffer, :effect_buffer_seconds, :spatial_effect
 
   SAMPLE_FLOAT = 0x100
   BASS_STREAM_DECODE = 0x200000
@@ -647,27 +689,40 @@ class Sound
   }.freeze
   @@finalizers = {}
 
-  def self.open_pcm(frequency:, channels:, type:, buffer:)
+  def self.output_devices
+    Bass.soundcards.filter_map do |device|
+      next if device.id == nil || device.id <= 0
+      OutputAudioDevice.new(id: device.id, name: device.name, driver: device.driver, flags: device.flags)
+    end
+  end
+
+  def self.open_pcm(frequency:, channels:, type:, buffer:, output_device: nil)
     sound = allocate
-    sound.__send__(:initialize_pcm, frequency: frequency, channels: channels, type: type, buffer: buffer)
+    sound.__send__(:initialize_pcm, frequency: frequency, channels: channels, type: type, buffer: buffer, output_device: output_device)
   end
 
   # :interactive selects a safe bounded buffer. Nil and :eager preserve eager buffering.
   # effect_buffer_seconds remains available for advanced callers.
-  def initialize(file = nil, sample: false, loop: false, stream: nil, effect_buffer: nil, effect_buffer_seconds: nil)
+  def initialize(file = nil, sample: false, loop: false, stream: nil, effect_buffer: nil, effect_buffer_seconds: nil, output_device: nil)
     initialize_sound_state(
       file: file,
       sample: sample,
       loop: loop,
       stream: stream,
       effect_buffer: effect_buffer,
-      effect_buffer_seconds: effect_buffer_seconds
+      effect_buffer_seconds: effect_buffer_seconds,
+      output_device: output_device
     )
     open_direct
     finish_initialization
+  rescue Exception
+    close if instance_variable_defined?(:@pipeline_mutex) && !closed?
+    raise
   end
 
-  def initialize_sound_state(file:, sample:, loop:, stream:, effect_buffer:, effect_buffer_seconds:)
+  def initialize_sound_state(file:, sample:, loop:, stream:, effect_buffer:, effect_buffer_seconds:, output_device: nil)
+    validate_output_device(output_device)
+    @output_device = output_device
     @file = file
     @stream_data = stream
     @sample = sample == true
@@ -795,7 +850,29 @@ class Sound
     @effect_buffer_seconds = @effect_buffer == :interactive ? INTERACTIVE_EFFECT_BUFFER_SECONDS : nil
   end
 
+  def output_device=(device)
+    validate_output_device(device)
+    @pipeline_mutex.synchronize do
+      raise RuntimeError, "Cannot change the output device of an unopened sound" if !opened?
+      with_output_device(device) do |target|
+        if @kind == :sample
+          change_sample_output_device(target)
+        else
+          change_stream_output_device(target)
+        end
+      end
+      @output_device = device
+    end
+  end
+
   def open_direct
+    with_output_device do
+      open_direct_on_device
+      update_finalizer if @finalizer_id != nil
+    end
+  end
+
+  def open_direct_on_device
     if @sample && @file != nil && @stream_data == nil && @file.to_s[0, 4] != "http"
       @sample_handle, @channel = Bass.create_sample_channel(@file)
       if @sample_handle != 0 && @channel != 0
@@ -810,7 +887,13 @@ class Sound
     Log.error("Cannot play audio: #{e.class}: #{e.message} #{Array(e.backtrace).join("\n")}")
   end
 
+  private :open_direct_on_device
+
   def open_effect_source(position = 0.0)
+    with_output_device { open_effect_source_on_device(position) }
+  end
+
+  def open_effect_source_on_device(position)
     close_native_handles
     flags = SAMPLE_FLOAT | BASS_STREAM_DECODE
     if @file == nil && @stream_data != nil
@@ -838,6 +921,8 @@ class Sound
     reset_effect_playback_state(@processing_frequency, @playback_channels)
     update_finalizer
   end
+
+  private :open_effect_source_on_device
 
   def opened?
     @channel.to_i != 0 && !closed?
@@ -1120,6 +1205,10 @@ class Sound
   end
 
   def close
+    @pipeline_mutex.synchronize { close_sound }
+  end
+
+  def close_sound
     return if @closed
     self.class.unregister_slide_event_sound(@slide_event_id)
     @slide_event_id = nil
@@ -1150,6 +1239,8 @@ class Sound
     @@finalizers.delete(@finalizer_id)
     nil
   end
+
+  private :close_sound
 
   def closed?
     @closed == true
@@ -1327,7 +1418,110 @@ class Sound
 
   private
 
-  def initialize_pcm(frequency:, channels:, type:, buffer:)
+  def validate_output_device(device)
+    if device != nil && !device.is_a?(OutputAudioDevice)
+      raise ArgumentError, "Output device must be an OutputAudioDevice or nil"
+    end
+  end
+
+  def with_output_device(device = @output_device, &block)
+    if device != nil
+      current = self.class.output_devices.find { |candidate| candidate == device }
+      if current == nil || !current.enabled?
+        raise RuntimeError, "Audio output device #{device.name.inspect} is unavailable"
+      end
+    end
+    Bass.with_output_device(device&.id, &block)
+  end
+
+  def change_stream_output_device(target)
+    handles = [@source_channel, @source_mixer, @channel, @playback_channel].select { |handle| handle.to_i != 0 }.uniq
+    previous = handles.map do |handle|
+      device = Bass::BASS_ChannelGetDevice.call(handle)
+      raise RuntimeError, "Cannot query sound output device: #{Bass.error_name}" if device == -1
+      [handle, device]
+    end
+    moved = []
+    begin
+      previous.each do |handle, device|
+        next if device == target
+        if Bass::BASS_ChannelSetDevice.call(handle, target) == 0
+          raise RuntimeError, "Cannot change sound output device: #{Bass.error_name}"
+        end
+        moved << [handle, device]
+      end
+    rescue Exception => error
+      failures = []
+      moved.reverse_each do |handle, device|
+        failures << Bass.error_name if Bass::BASS_ChannelSetDevice.call(handle, device) == 0
+      end
+      raise RuntimeError, "#{error.message}; cannot restore sound output device: #{failures.join(', ')}" if !failures.empty?
+      raise
+    end
+  end
+
+  def change_sample_output_device(target)
+    previous = Bass::BASS_ChannelGetDevice.call(@sample_handle)
+    raise RuntimeError, "Cannot query sample output device: #{Bass.error_name}" if previous == -1
+    return if previous == target
+
+    state = sample_output_state
+    if Bass::BASS_ChannelSetDevice.call(@sample_handle, target) == 0
+      raise RuntimeError, "Cannot change sample output device: #{Bass.error_name}"
+    end
+    begin
+      restore_sample_output_state(state)
+    rescue Exception => error
+      if Bass::BASS_ChannelSetDevice.call(@sample_handle, previous) == 0
+        raise RuntimeError, "#{error.message}; cannot restore sample output device: #{Bass.error_name}"
+      end
+      restore_sample_output_state(state)
+      raise error
+    ensure
+      update_finalizer
+    end
+  end
+
+  def sample_output_state
+    attributes = (ATTRIBUTE_CLASSES.values + @sound_attributes.values.map(&:class)).uniq.filter_map do |attribute|
+      next if !attribute::WRITABLE
+      buffer = [0.0].pack("f")
+      next if Bass::BASS_ChannelGetAttribute.call(@channel, attribute::ID, buffer) == 0
+      [attribute::ID, buffer.unpack1("f")]
+    end
+    {
+      attributes: attributes,
+      position: Bass::BASS_ChannelGetPosition.call(@channel, 0),
+      flags: Bass::BASS_ChannelFlags.call(@channel, 0, 0),
+      status: status
+    }
+  end
+
+  def restore_sample_output_state(state)
+    cancel_all_tracked_slides
+    @channel = Bass::BASS_SampleGetChannel.call(@sample_handle, 0)
+    raise RuntimeError, "Cannot recreate sample channel: #{Bass.error_name}" if @channel.to_i == 0
+    @info_values = nil
+    Bass::BASS_ChannelFlags.call(@channel, state[:flags] & BASS_SAMPLE_LOOP, BASS_SAMPLE_LOOP)
+    state[:attributes].each do |id, value|
+      if Bass::BASS_ChannelSetAttribute.call(@channel, id, value) == 0
+        raise RuntimeError, "Cannot restore sample attribute #{id}: #{Bass.error_name}"
+      end
+    end
+    if Bass::BASS_ChannelSetPosition.call(@channel, state[:position], 0) == 0
+      raise RuntimeError, "Cannot restore sample position: #{Bass.error_name}"
+    end
+    if !state[:status].stopped?
+      if Bass::BASS_ChannelPlay.call(@channel, 0) == 0
+        raise RuntimeError, "Cannot resume sample: #{Bass.error_name}"
+      end
+      if state[:status].paused? && Bass::BASS_ChannelPause.call(@channel) == 0
+        raise RuntimeError, "Cannot pause sample: #{Bass.error_name}"
+      end
+    end
+  end
+
+  def initialize_pcm(frequency:, channels:, type:, buffer:, output_device: nil)
     frequency = Integer(frequency)
     channels = Integer(channels)
     raise ArgumentError, "PCM frequency must be positive" if frequency <= 0
@@ -1347,12 +1541,15 @@ class Sound
       loop: false,
       stream: nil,
       effect_buffer: nil,
-      effect_buffer_seconds: nil
+      effect_buffer_seconds: nil,
+      output_device: output_device
     )
     @pcm_type = type
     @pcm_sample_bytes = format[1]
     @pcm_frame_bytes = frame_bytes
-    @source_channel, @channel = Bass.create_push_stream_channel(frequency, channels, format[0])
+    with_output_device do
+      @source_channel, @channel = Bass.create_push_stream_channel(frequency, channels, format[0])
+    end
     raise RuntimeError, "Cannot create PCM stream: #{Bass.error_name}" if @channel.to_i == 0
     @kind = :pcm
     finish_initialization

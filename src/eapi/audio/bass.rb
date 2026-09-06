@@ -139,7 +139,7 @@ module Bass
   BASSVST = optional_dlopen("bass_vst")
   BASS_GetVersion = Fiddle::Function.new(BASSDLL["BASS_GetVersion"], [], F_INT, BASS_ABI)
   BASS_ErrorGetCode = Fiddle::Function.new(BASSDLL["BASS_ErrorGetCode"], [], F_INT, BASS_ABI)
-  BASS_Init = Fiddle::Function.new(BASSDLL["BASS_Init"], [F_INT, F_INT, F_INT, F_PTR], F_INT, BASS_ABI)
+  BASS_Init = Fiddle::Function.new(BASSDLL["BASS_Init"], [F_INT, F_INT, F_INT, F_PTR, F_PTR], F_INT, BASS_ABI)
   BASS_GetInfo = Fiddle::Function.new(BASSDLL["BASS_GetInfo"], [F_PTR], F_INT, BASS_ABI)
   BASS_RecordInit = Fiddle::Function.new(BASSDLL["BASS_RecordInit"], [F_INT], F_INT, BASS_ABI)
   BASS_RecordGetDevice = Fiddle::Function.new(BASSDLL["BASS_RecordGetDevice"], [], F_INT, BASS_ABI)
@@ -177,6 +177,7 @@ module Bass
   BASS_ChannelStop = Fiddle::Function.new(BASSDLL["BASS_ChannelStop"], [F_UINT], F_INT, BASS_ABI)
   BASS_ChannelPause = Fiddle::Function.new(BASSDLL["BASS_ChannelPause"], [F_UINT], F_INT, BASS_ABI)
   BASS_ChannelSetDevice = Fiddle::Function.new(BASSDLL["BASS_ChannelSetDevice"], [F_UINT, F_INT], F_INT, BASS_ABI)
+  BASS_ChannelGetDevice = Fiddle::Function.new(BASSDLL["BASS_ChannelGetDevice"], [F_UINT], F_INT, BASS_ABI)
   BASS_StreamPutData = Fiddle::Function.new(BASSDLL["BASS_StreamPutData"], [F_UINT, F_PTR, F_UINT], F_INT, BASS_ABI)
   BASS_ChannelGetData = Fiddle::Function.new(BASSDLL["BASS_ChannelGetData"], [F_UINT, F_PTR, F_UINT], F_INT, BASS_ABI)
   BASS_ChannelGetLength = Fiddle::Function.new(BASSDLL["BASS_ChannelGetLength"], [F_UINT, F_UINT], F_QWORD, BASS_ABI)
@@ -313,7 +314,7 @@ module Bass
   def self.clear_memory_stream_data
     memory_stream_mutex.synchronize do
       @memory_stream_data ||= {}
-      @memory_stream_data.clear
+      @memory_stream_data.delete_if { |channel, _entry| BASS_ChannelGetDevice.call(channel) == -1 }
     end
     true
   end
@@ -370,10 +371,12 @@ module Bass
 
   class Device
     attr_accessor :name, :driver, :flags
-    def initialize(name="", driver="", flags=0)
+    attr_reader :id
+    def initialize(name="", driver="", flags=0, id=nil)
       @name=name
       @driver=driver
       @flags=flags
+      @id=id
       end
     def enabled?
       (@flags&1)!=0
@@ -407,16 +410,60 @@ module Bass
                   next
                 end
                 name=sc
-                driver=""
+                driver=c_string(a[1])
                 flags=a[2]
                 cds[name]||=0
                 cds[name]+=1
                 name+=" (#{cds[name]})" if cds[name]>1
-                ret.push(Device.new(name, driver, flags))
+                ret.push(Device.new(name, driver, flags, index))
         index+=1
       end
     return ret
     end
+
+  def self.output_device_id
+    @output_device_id || cardid
+  end
+
+  def self.ensure_output_device(device, hWnd = nil, samplerate = 48000)
+    previous = BASS_GetDevice.call
+    device = output_device_id if device == nil
+    if device == -1
+      device = soundcards.find { |card| card.enabled? && card.default? }&.id
+      raise RuntimeError, "No default audio output device is available" if device == nil
+    end
+    (@output_device_mutex ||= Mutex.new).synchronize do
+      info = EltenBassStructs.bass_device_info_buffer
+      if BASS_GetDeviceInfo.call(device, info) == 0
+        raise RuntimeError, "Cannot query audio output device #{device}: #{error_name}"
+      end
+      flags = EltenBassStructs.bass_device_info_values(info)[2]
+      raise RuntimeError, "Audio output device #{device} is disabled" if (flags & 1) == 0
+      if (flags & 4) == 0
+        if BASS_Init.call(device, samplerate, 4, hWnd || $wnd || 0, nil) == 0
+          error = BASS_ErrorGetCode.call
+          raise RuntimeError, "Cannot initialize audio output device #{device}: #{error_name(error)}" if error != 14
+        else
+          @additional_output_devices ||= []
+          @additional_output_devices << device unless @additional_output_devices.include?(device)
+        end
+      end
+    end
+    device
+  ensure
+    BASS_SetDevice.call(previous) if previous != nil && previous >= 0 && BASS_GetDevice.call != previous
+  end
+
+  def self.with_output_device(device = nil)
+    previous = BASS_GetDevice.call
+    target = ensure_output_device(device)
+    if BASS_SetDevice.call(target) == 0
+      raise RuntimeError, "Cannot select audio output device #{target}: #{error_name}"
+    end
+    yield target
+  ensure
+    BASS_SetDevice.call(previous) if previous != nil && previous >= 0 && BASS_GetDevice.call != previous
+  end
 
     def self.microphones
           BASS_SetConfig.call(42, 1)
@@ -496,10 +543,11 @@ module Bass
             hWnd||=$wnd||0
             @@device=d
             if @init==true
+            BASS_SetDevice.call(@output_device_id) if @output_device_id != nil
             BASS_Free.call
             clear_memory_stream_data
-      BASS_Init.call(d, samplerate, 4, hWnd)
-      BASS_SetDevice.call(d)
+      @output_device_id = ensure_output_device(d, hWnd, samplerate)
+      BASS_SetDevice.call(@output_device_id)
     else
       @setdeviceoninit=d
       end
@@ -509,7 +557,7 @@ module Bass
       c=-1
       if card!=nil && card!="default"
         cards=soundcards
-        c=cards.map{|dev|dev.name}.index(card)||-1
+        c=cards.find{|dev|dev.name==card}&.id||-1
       end
       setdevice(c, hWnd, samplerate)
       c
@@ -606,9 +654,10 @@ return if @init==true
      card=-1
      card=@setdeviceoninit if @setdeviceoninit!=nil
     @@device=card
-        if BASS_Init.call(card, samplerate, 4, hWnd) == 0
+        if BASS_Init.call(card, samplerate, 4, hWnd, nil) == 0
       raise(error_name)
     end
+    @output_device_id = BASS_GetDevice.call
     plugins = ["bassopus", "bassflac", "bassmidi", "basswebm", "basswma", "bass_aac", "bass_ac3", "bass_spx", "basshls", "bassalac"]
         plugins.each do |pl|
               Log.debug("Loading Bass plugin #{pl}")
@@ -631,10 +680,14 @@ prewarm_url_loader
         end
 
   def self.free
-    @init=false
-    if BASS_Free.call == 0 then
-      raise(error_name)
+    devices = [output_device_id, *(@additional_output_devices || [])].uniq
+    devices.each do |device|
+      next if device < 0 || BASS_SetDevice.call(device) == 0
+      raise(error_name) if BASS_Free.call == 0
     end
+    @init = false
+    @output_device_id = nil
+    @additional_output_devices = []
     clear_memory_stream_data
   end
 
@@ -689,7 +742,13 @@ prewarm_url_loader
       return [0, 0]
     end
     channel = BASS_SampleGetChannel.call(handle, 0)
-    Log.error("BASS sample channel failed: #{error_name}, file=#{filename.inspect}, runtime=#{EltenRuntimePaths.runtime_directory_name}") if channel == 0    [handle, channel]
+    if channel == 0
+      error = error_name
+      BASS_SampleFree.call(handle)
+      Log.error("BASS sample channel failed: #{error}, file=#{filename.inspect}, runtime=#{EltenRuntimePaths.runtime_directory_name}")
+      return [0, 0]
+    end
+    [handle, channel]
   end
 end
 
