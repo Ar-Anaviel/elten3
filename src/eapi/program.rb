@@ -14,7 +14,7 @@ require "stringio"
 
 module Programs
   MAGIC = "Elten3AppPackage".b
-  ELTEN_API_VERSION = "3.0.2".freeze
+  ELTEN_API_VERSION = "3.0.2.1".freeze
   ELTENLINK_CONTRACT_VERSION = "3.0".freeze
   MANIFEST_BEGIN = /^\=begin[ \t]+Elten3AppInfo[ \t]*\r?\n/.freeze
   MANIFEST_END = /^\=end[ \t]+Elten3AppInfo[ \t]*$/m.freeze
