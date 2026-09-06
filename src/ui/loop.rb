@@ -60,6 +60,7 @@ end
           sc=$scene
     if Thread::current==$mainthread
       while $currentthread!=Thread::current && $exitproc!=true && $reset!=true
+        EltenAPI::LiveSessions.tick(dispatch: false) if defined?(EltenAPI::LiveSessions)
         EltenWindow.service_window_update
         sleep(0.005)
       end
@@ -77,6 +78,7 @@ end
     Log.info("Thread resumed #{l}")
     $scene=sc
        end
+       EltenAPI::LiveSessions.tick(dispatch: false) if defined?(EltenAPI::LiveSessions) && Thread::current == $mainthread
        Programs::Extensions.tick if defined?(Programs::Extensions) && Thread::current == $mainthread
        EltenAPI::Scheduler.tick if defined?(EltenAPI::Scheduler) && Thread::current == $mainthread
        EltenAPI::Communication.tick if defined?(EltenAPI::Communication) && Thread::current == $mainthread

@@ -20,6 +20,25 @@ module EltenLink
       super(message || self.class.message_for(code, module_name))
     end
 
+    def details
+      error_payload["details"]
+    end
+
+    def retry_after
+      value = error_payload["retry_after"] || (details["retry_after"] if details.is_a?(Hash))
+      value.nil? ? nil : value.to_f
+    end
+
+    def status
+      error_payload["status"]
+    end
+
+    def error_payload
+      error = @response["error"] if @response.is_a?(Hash)
+      error.is_a?(Hash) ? error : {}
+    end
+    private :error_payload
+
     def self.message_for(code, module_name = nil)
       text = PREDEFINED[code.to_s] || "Server returned error #{code}"
       module_name == nil ? text : "#{text} (#{module_name})"

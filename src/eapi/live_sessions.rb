@@ -9,42 +9,72 @@ require "thread"
 module EltenAPI
   module LiveSessions
     CONTROL_INTERVAL = 5.0
-    CONTROL_RETRY_INTERVAL = 2.0
+    CONTROL_TIMEOUT = 5.0
+    CONTROL_RETRY_INTERVAL = 1.0
+    ACK_INTERVAL = 0.1
+    MAX_QUEUE_ITEMS = 4_096
+    MAX_QUEUE_BYTES = 8 * 1024 * 1024
     MAX_PENDING_INVITATIONS = 128
 
     class Error < StandardError; end
     class TimeoutError < Error; end
     class SessionClosed < Error; end
     class NotOwner < Error; end
+    class QueueOverflow < Error; end
 
     Message = Struct.new(:id, :sequence, :sender, :packet, keyword_init: true)
 
     class EventQueue
-      def initialize
+      def initialize(limit: MAX_QUEUE_ITEMS, max_bytes: MAX_QUEUE_BYTES)
         @items = []
+        @bytes = 0
+        @limit, @max_bytes = limit, max_bytes
         @mutex = Mutex.new
         @condition = ConditionVariable.new
+        @closed = nil
       end
 
-      def push(item)
+      def push(item, bytes: 1)
         @mutex.synchronize do
-          @items << item
+          raise @closed if @closed
+          raise QueueOverflow, "Live session queue is full" if @items.length >= @limit || @bytes + bytes > @max_bytes
+          @items << [item, bytes]
+          @bytes += bytes
           @condition.signal
         end
         item
       end
-
       alias << push
 
-      def pop(timeout: nil)
-        deadline = timeout == nil ? nil : monotonic + timeout.to_f
-        @mutex.synchronize do
-          while @items.empty?
-            return nil if !deadline.nil? && deadline <= monotonic
-            @condition.wait(@mutex, deadline == nil ? nil : deadline - monotonic)
+      def pop(timeout: nil, cancellation_token: nil, pump: nil)
+        deadline = timeout.nil? ? nil : monotonic + [timeout.to_f, 0].max
+        loop do
+          cancellation_token&.raise_if_cancelled!
+          @mutex.synchronize do
+            unless @items.empty?
+              item, bytes = @items.shift
+              @bytes -= bytes
+              return item
+            end
+            raise @closed if @closed
+            remaining = deadline.nil? ? nil : deadline - monotonic
+            return nil if remaining && remaining <= 0
+            @condition.wait(@mutex, [remaining || 0.05, 0.05].min) unless pump
           end
-          @items.shift
+          pump.call if pump
         end
+      end
+
+      def close(error = SessionClosed.new("Live session is closed"))
+        @mutex.synchronize { @closed ||= error; @condition.broadcast }
+      end
+
+      def clear
+        @mutex.synchronize { @items.clear; @bytes = 0 }
+      end
+
+      def size
+        @mutex.synchronize { @items.length }
       end
 
       private
@@ -108,7 +138,10 @@ module EltenAPI
     end
 
     class Session
-      attr_reader :id, :metadata, :capacity, :owner_id, :participant_id, :state
+      MISSING_PACKET = Object.new.freeze
+      private_constant :MISSING_PACKET
+
+      attr_reader :id, :metadata, :capacity, :owner_id, :participant_id, :state, :limits
 
       def initialize(endpoint, data)
         @endpoint = endpoint
@@ -116,6 +149,9 @@ module EltenAPI
         @condition = ConditionVariable.new
         @callbacks = Hash.new { |hash, key| hash[key] = [] }
         @messages = EventQueue.new
+        @delivery_mutex = Mutex.new
+        @receive_requested = false
+        @snapshot_revision = -1
         @participants = {}
         @ack = 0
         @state = :open
@@ -151,14 +187,22 @@ module EltenAPI
         Array(users).map { |user| invite(user, metadata: metadata) }
       end
 
-      def send(packet)
+      def send(packet = MISSING_PACKET, message_id: nil, retries: 2, cancellation_token: nil, **packet_fields)
+        # Preserve send("type" => "move") and send(type: "move") on Ruby 3+
+        # while accepting explicit delivery options with a positional packet.
+        if packet.equal?(MISSING_PACKET) && !packet_fields.empty?
+          packet = packet_fields
+        elsif packet.equal?(MISSING_PACKET) || !packet_fields.empty?
+          raise ArgumentError, "exactly one packet is required"
+        end
         ensure_open!
         validate_json!(packet)
-        @endpoint.send_packet(self, packet)
+        @endpoint.send_packet(self, packet, message_id: message_id, retries: retries, cancellation_token: cancellation_token)
       end
 
-      def receive(timeout: nil)
-        @messages.pop(timeout: timeout)
+      def receive(timeout: nil, cancellation_token: nil)
+        @mutex.synchronize { @receive_requested = true }
+        @messages.pop(timeout: timeout, cancellation_token: cancellation_token, pump: -> { @endpoint.wait_step(cancellation_token: cancellation_token) })
       end
 
       def leave
@@ -182,19 +226,16 @@ module EltenAPI
       def on_gap(&block); register_callback(:gap, &block); end
       def on_closed(&block); register_callback(:closed, &block); end
 
-      def wait_for_participant(user = nil, timeout: 10)
+      def wait_for_participant(user = nil, timeout: 10, cancellation_token: nil)
         deadline = monotonic + timeout.to_f
-        @mutex.synchronize do
-          loop do
-            found = @participants.values.find do |entry|
-              entry.id != @participant_id && (user == nil || entry.user.casecmp?(user.to_s))
-            end
-            return found unless found.nil?
+        loop do
+          found = @mutex.synchronize do
             raise SessionClosed, "Live session is closed" if @state == :closed
-            remaining = deadline - monotonic
-            raise TimeoutError, "Participant did not join in time" if remaining <= 0
-            @condition.wait(@mutex, remaining)
+            @participants.values.find { |entry| entry.id != @participant_id && (user.nil? || entry.user.casecmp?(user.to_s)) }
           end
+          return found if found
+          raise TimeoutError, "Participant did not join in time" if monotonic >= deadline
+          @endpoint.wait_step(cancellation_token: cancellation_token)
         end
       end
 
@@ -209,17 +250,26 @@ module EltenAPI
       end
 
       def apply_envelope(data)
-        apply_snapshot(data)
-        seen = @mutex.synchronize { @ack }
-        Array(data["events"]).sort_by { |event| event["seq"].to_i }.each do |event|
-          sequence = event["seq"].to_i
-          next if sequence <= seen
-          apply_event(event)
-          seen = sequence
+        @delivery_mutex.synchronize do
+          return false if closed?
+          # Snapshots and event cursors have different jobs: a stale snapshot may
+          # accompany an event page we still need, so only the snapshot is ignored.
+          apply_snapshot(data)
+          seen = @mutex.synchronize { @ack }
+          Array(data["events"]).sort_by { |event| event["seq"].to_i }.each do |event|
+            sequence = event["seq"].to_i
+            next if sequence <= seen
+            apply_event(event)
+            seen = sequence
+          end
+          cursor = data["cursor"].to_i
+          @mutex.synchronize { @ack = [@ack, cursor].max }
+          data["has_more"] == true
         end
-        cursor = data["cursor"].to_i
-        @mutex.synchronize { @ack = [@ack, cursor].max }
-        data["has_more"] == true
+      rescue QueueOverflow => error
+        @endpoint.record_error(error)
+        close_local(:queue_overflow)
+        false
       end
 
       def close_local(reason)
@@ -230,6 +280,7 @@ module EltenAPI
           true
         end
         if changed
+          @messages.close
           @endpoint.session_closed(self)
           emit(:closed, reason.to_sym)
         end
@@ -240,6 +291,11 @@ module EltenAPI
 
       def apply_snapshot(data)
         @mutex.synchronize do
+          revision = data["revision"]
+          return if !revision.nil? && revision.to_i < @snapshot_revision
+          @snapshot_revision = revision.to_i unless revision.nil?
+          @limits = data["limits"] if data["limits"].is_a?(Hash)
+          @limits ||= {}
           @id = (data["id"] || data["session_id"] || @id).to_s
           @metadata = data["metadata"] if data["metadata"].is_a?(Hash)
           @metadata ||= {}
@@ -271,21 +327,22 @@ module EltenAPI
             sender: sender,
             packet: event["packet"]
           )
-          @messages << message
+          pull = @mutex.synchronize { @receive_requested || @callbacks[:message].empty? }
+          @messages.push(message, bytes: JSON.generate(message.packet).bytesize + 256) if pull
           emit(:message, sender, message.packet)
         when "participant_joined"
           row = event["participant"]
           if row.is_a?(Hash)
             item = @mutex.synchronize do
               id = row["id"].to_s
-              @participants[id] ||= Participant.new(row)
+              @participants[id] || Participant.new(row)
             end
             emit(:participant_joined, item)
           end
         when "participant_left"
           row = event["participant"].is_a?(Hash) ? event["participant"] : {}
           item = @mutex.synchronize do
-            removed = @participants.delete(row["id"].to_s)
+            removed = @participants[row["id"].to_s]
             @condition.broadcast
             removed || Participant.new(row)
           end
@@ -299,7 +356,10 @@ module EltenAPI
 
       def register_callback(kind, &block)
         raise ArgumentError, "callback is required" if block == nil
-        @mutex.synchronize { @callbacks[kind] << block }
+        @mutex.synchronize do
+          @callbacks[kind] << block
+          @messages.clear if kind == :message && !@receive_requested
+        end
         self
       end
 
@@ -324,7 +384,7 @@ module EltenAPI
     end
 
     class Endpoint
-      attr_reader :app_id, :instance_id, :user
+      attr_reader :app_id, :instance_id, :user, :last_error, :limits
 
       def initialize(app_id:, client:, user: nil, token: nil)
         @app_id = app_id.to_s.downcase
@@ -338,14 +398,25 @@ module EltenAPI
         @instance_id = SecureRandom.uuid
         @mutex = Mutex.new
         @sessions = {}
+        @lease_deadlines = {}
         @invitations = {}
         @resolved_invitations = {}
         @pending_envelopes = Hash.new { |hash, key| hash[key] = [] }
+        @pending_envelope_bytes = 0
+        @callback_bytes = 0
         @callbacks = Hash.new { |hash, key| hash[key] = [] }
-        @callback_queue = Queue.new
+        @callback_queue = SizedQueue.new(MAX_QUEUE_ITEMS)
         @invitation_queue = EventQueue.new
         @control_responses = Queue.new
-        @control_pending = false
+        @control_pending = nil
+        @control_serial = 0
+        @control_failures = 0
+        @retry_not_before = 0.0
+        @control_rotation = 0
+        @protocol_mutex = Mutex.new
+        @limits = {}
+        @last_error = nil
+        @overflow = false
         @next_control_at = monotonic
         @closed = false
         LiveSessions.register(self)
@@ -382,8 +453,8 @@ module EltenAPI
         register_callback(:invitation, &block)
       end
 
-      def next_invitation(timeout: nil)
-        @invitation_queue.pop(timeout: timeout)
+      def next_invitation(timeout: nil, cancellation_token: nil)
+        @invitation_queue.pop(timeout: timeout, cancellation_token: cancellation_token, pump: -> { wait_step(cancellation_token: cancellation_token) })
       end
 
       def closed?
@@ -396,6 +467,8 @@ module EltenAPI
           @closed = true
           @sessions.values.reject(&:closed?)
         end
+        cancel_control
+        @invitation_queue.close
         current.each do |session|
           begin
             EltenLink::Apps.leave_live_session(
@@ -444,15 +517,38 @@ module EltenAPI
         true
       end
 
-      def send_packet(session, packet)
+      def send_packet(session, packet, message_id: nil, retries: 2, cancellation_token: nil)
         ensure_session!(session)
-        EltenLink::Apps.send_live_session(
-          @client,
-          session_id: session.id,
-          participant_id: session.participant_id,
-          packet: packet,
-          message_id: SecureRandom.uuid
-        )
+        message_id ||= SecureRandom.uuid
+        packet = JSON.parse(JSON.generate(packet))
+        deadline = monotonic + 45.0
+        attempts = 0
+        begin
+          cancellation_token&.raise_if_cancelled!
+          attempts += 1
+          result = EltenLink::Apps.send_live_session(
+            @client, session_id: session.id, participant_id: session.participant_id,
+            packet: packet, message_id: message_id,
+            timeout: [15.0, deadline - monotonic].min, cancellation_token: cancellation_token
+          )
+          @last_error = nil
+          renew_local_lease(session.id)
+          result
+        rescue EltenLink::Error => error
+          @last_error = error
+          if %w[apps.live_sessions.closed apps.live_sessions.not_found apps.live_sessions.membership_required].include?(error.code)
+            session.close_local(:expired)
+          end
+          retryable = %w[network_error timeout invalid_json rate_limits.exceeded rate_limits.unavailable apps.live_sessions.rate_limited apps.live_sessions.busy apps.live_sessions.unavailable].include?(error.code) || [500, 502, 503, 504].include?(error.status.to_i)
+          delay = [error.retry_after.to_f, [2**(attempts - 1), 5].min].max
+          if retryable && attempts <= [[retries.to_i, 0].max, 2].min && monotonic + delay < deadline && !session.closed?
+            retry_at = monotonic + delay
+            wait_step(cancellation_token: cancellation_token) while monotonic < retry_at
+            retry
+          end
+          record_error(error)
+          raise
+        end
       end
 
       def leave_session(session)
@@ -473,13 +569,70 @@ module EltenAPI
         )
       end
 
-      def session_closed(_session)
+      def session_closed(session)
+        @mutex.synchronize do
+          @sessions.delete(session.id)
+          @lease_deadlines.delete(session.id)
+          removed = @pending_envelopes.delete(session.id) || []
+          @pending_envelope_bytes -= removed.sum { |item| item[1] }
+        end
         true
       end
 
+      # Called only while a public blocking operation is waiting. Scheduling still
+      # enters through the application's loop_update; no timer/worker loop is started.
+      def wait_step(cancellation_token: nil)
+        cancellation_token&.raise_if_cancelled!
+        context = @client.context if @client.respond_to?(:context)
+        owner = $currentthread if defined?($currentthread)
+        owner ||= $mainthread if defined?($mainthread)
+        if context && context.respond_to?(:loop_update, true) && (owner.nil? || owner == Thread.current)
+          context.__send__(:loop_update, false)
+        else
+          sleep 0.01
+        end
+        cancellation_token&.raise_if_cancelled!
+      end
+
+      def diagnostics
+        @mutex.synchronize do
+          {
+            instance_id: @instance_id,
+            sessions: @sessions.values.map(&:control_entry),
+            callback_count: @callback_queue.length,
+            callback_bytes: @callback_bytes,
+            pending_envelope_bytes: @pending_envelope_bytes,
+            control_pending: !@control_pending.nil?,
+            control_failures: @control_failures,
+            last_error_code: @last_error.respond_to?(:code) ? @last_error.code : @last_error&.class&.name
+          }
+        end
+      end
+
+      def on_error(&block)
+        register_callback(:error, &block)
+      end
+
+      def record_error(error)
+        @last_error = error
+        Log.warning("Live session error: #{error.class}: #{error.message}") if defined?(Log)
+        emit(:error, error)
+      end
+
       def enqueue_callback(callback, *arguments)
-        @callback_queue << [callback, arguments]
+        bytes = JSON.generate(arguments).bytesize + 64
+        @mutex.synchronize do
+          if @callback_bytes + bytes > MAX_QUEUE_BYTES
+            @overflow = true
+            return false
+          end
+          @callback_queue.push([callback, arguments, bytes], true)
+          @callback_bytes += bytes
+        end
         true
+      rescue ThreadError
+        @overflow = true
+        false
       end
 
       def enqueue_envelope(envelope)
@@ -497,28 +650,63 @@ module EltenAPI
       end
 
       def tick
-        return false if closed?
-        drain_control_responses
+        protocol_tick
         dispatch_events
-        expire_invitations
-        now = monotonic
-        start_control(now) if now >= @next_control_at.to_f
-        true
+      end
+
+      # Bounded work, invoked by LiveSessions.tick from loop_update before callbacks.
+      def protocol_tick
+        return false if closed? || !@protocol_mutex.try_lock
+        begin
+          drain_control_responses
+          expire_invitations
+          now = monotonic
+          expired = @mutex.synchronize { @lease_deadlines.select { |_id, deadline| now >= deadline }.keys }
+          expired.each do |id|
+            session = @mutex.synchronize { @sessions[id] }
+            session&.close_local(:timeout)
+          end
+          if @control_pending && now >= @control_pending[:deadline]
+            cancel_control
+            control_failed(TimeoutError.new("Live session control timed out"))
+          end
+          if @overflow
+            @overflow = false
+            @mutex.synchronize { @callback_queue.clear; @callback_bytes = 0 }
+            record_error(QueueOverflow.new("Live session callback queue is full"))
+            sessions.each { |session| session.close_local(:queue_overflow) }
+          end
+          start_control(now) if now >= @next_control_at.to_f && now >= @retry_not_before
+          true
+        ensure
+          @protocol_mutex.unlock
+        end
       end
 
       def dispatch_events(limit = 100)
+        return 0 if @dispatching
+        @dispatching = true
         count = 0
-        while count < limit
-          callback, arguments = @callback_queue.pop(true)
-          begin
-            callback.call(*arguments)
-          rescue Exception => error
-            Log.warning("Live session callback failed: #{error.class}: #{error.message}") if defined?(Log)
+        started = monotonic
+        begin
+          while count < limit && monotonic - started < 0.01
+            callback, arguments, _bytes = @mutex.synchronize do
+              entry = @callback_queue.pop(true)
+              @callback_bytes -= entry[2]
+              entry
+            end
+            begin
+              callback.call(*arguments)
+            rescue Exception => error
+              Log.warning("Live session callback failed: #{error.class}: #{error.message}") if defined?(Log)
+            end
+            count += 1
           end
-          count += 1
+        rescue ThreadError
+          nil
+        ensure
+          @dispatching = false
         end
-        count
-      rescue ThreadError
         count
       end
 
@@ -539,14 +727,23 @@ module EltenAPI
       def receive_events(data)
         session = @mutex.synchronize { @sessions[data["session_id"].to_s] }
         if session.nil?
+          bytes = JSON.generate(data).bytesize
           @mutex.synchronize do
             queue = @pending_envelopes[data["session_id"].to_s]
-            queue << data
-            queue.shift while queue.length > 32
+            queue << [data, bytes]
+            @pending_envelope_bytes += bytes
+            @pending_envelope_bytes -= queue.shift[1] while queue.length > 32
+            while @pending_envelopes.length > MAX_PENDING_INVITATIONS || @pending_envelope_bytes > MAX_QUEUE_BYTES
+              _, removed = @pending_envelopes.shift
+              @pending_envelope_bytes -= removed.sum { |item| item[1] }
+            end
           end
           return
         end
-        request_control if session.apply_envelope(data)
+        return if !data["participant_id"].to_s.empty? && data["participant_id"].to_s != session.participant_id
+        before = session.control_entry["ack"]
+        more = session.apply_envelope(data)
+        request_control(more ? 0 : ACK_INTERVAL) if more || session.control_entry["ack"] > before
       end
 
       def store_session(data)
@@ -559,9 +756,13 @@ module EltenAPI
             session = existing
           end
           @next_control_at = monotonic
-          @pending_envelopes.delete(session.id) || []
+          removed = @pending_envelopes.delete(session.id) || []
+          @pending_envelope_bytes -= removed.sum { |item| item[1] }
+          removed.map(&:first)
         end
-        pending.each { |envelope| session.apply_envelope(envelope) }
+        pending.each { |envelope| receive_events(envelope) }
+        @limits = data["limits"] if data["limits"].is_a?(Hash)
+        renew_local_lease(session.id)
         session
       end
 
@@ -582,54 +783,105 @@ module EltenAPI
       end
 
       def start_control(now)
-        entries = sessions.map(&:control_entry)
-        @mutex.synchronize do
-          @next_control_at = now + CONTROL_INTERVAL
-          return if @control_pending || entries.empty? || @closed
-          @control_pending = true
-        end
+        return if @control_pending
+        current = sessions
+        return if current.empty? || closed?
+        maximum = [@limits.fetch("max_sessions_per_user", 16).to_i, 1].max
+        entries = current.rotate(@control_rotation % current.length).first(maximum).map(&:control_entry)
+        @control_rotation += current.length > maximum ? entries.length : 1
+        @control_serial += 1
+        serial = @control_serial
+        cancellation = EltenAPI::Tasks::CancellationToken.new if defined?(EltenAPI::Tasks::CancellationToken)
+        @control_pending = { serial: serial, started_at: now, deadline: now + CONTROL_TIMEOUT, cancellation: cancellation }
+        @next_control_at = now + (current.length > maximum ? ACK_INTERVAL : CONTROL_INTERVAL)
         path = EltenLink::Client.append_query(
-          "/api/v1/apps/live-sessions/control",
-          { "name" => @user, "token" => @token }
+          "/api/v1/apps/live-sessions/control", { "name" => @user, "token" => @token }
         )
         @client.e_json_request(
-          "POST",
-          path,
-          { "appid" => @app_id, "instance_id" => @instance_id, "sessions" => entries }
+          "POST", path,
+          { "appid" => @app_id, "instance_id" => @instance_id, "sessions" => entries, "recover" => true },
+          cancellation_token: cancellation
         ) do |answer, _data|
-          @control_responses << answer
+          # Network callbacks never schedule the next request.
+          @control_responses << [serial, answer]
         end
       rescue Exception => error
-        @mutex.synchronize do
-          @control_pending = false
-          @next_control_at = monotonic + CONTROL_RETRY_INTERVAL
-        end
-        Log.warning("Live session control failed: #{error.class}: #{error.message}") if defined?(Log)
+        cancel_control
+        control_failed(error)
       end
 
       def drain_control_responses
         loop do
-          answer = @control_responses.pop(true)
-          @mutex.synchronize { @control_pending = false }
-          payload = answer.is_a?(String) ? JSON.parse(answer) : nil
-          data = payload.is_a?(Hash) && payload["success"] == true ? payload["data"] : nil
-          unless data.is_a?(Hash) && data["accepted"] == true
-            request_control(CONTROL_RETRY_INTERVAL)
-            next
-          end
-          lease = data["lease_seconds"].to_f
-          interval = lease.positive? ? [[lease / 3.0, 2.0].max, CONTROL_INTERVAL].min : CONTROL_INTERVAL
-          @mutex.synchronize { @next_control_at = monotonic + interval }
-          Array(data["sessions"]).each do |status|
-            next unless status.is_a?(Hash) && status["accepted"] != true
-            session = @mutex.synchronize { @sessions[status["id"].to_s] }
-            session&.close_local((status["reason"] || "expired").to_sym)
+          serial, answer = @control_responses.pop(true)
+          next unless @control_pending && @control_pending[:serial] == serial
+          started_at = @control_pending[:started_at]
+          @control_pending = nil
+          begin
+            payload = answer.is_a?(String) ? JSON.parse(answer) : nil
+            data = payload.is_a?(Hash) && payload["success"] == true ? payload["data"] : nil
+            unless data.is_a?(Hash) && data["accepted"] == true
+              error = EltenLink::Error.new(
+                payload.is_a?(Hash) ? payload.dig("error", "message") : "Live session control failed",
+                code: payload.is_a?(Hash) ? payload.dig("error", "code") : "network_error", response: payload
+              )
+              control_failed(error)
+              next
+            end
+            @control_failures = 0
+            @retry_not_before = 0.0
+            @last_error = nil
+            @limits = data["limits"] if data["limits"].is_a?(Hash)
+            lease = data["lease_seconds"].to_f
+            interval = lease.positive? ? [[lease / 3.0, 2.0].max, CONTROL_INTERVAL].min : CONTROL_INTERVAL
+            @mutex.synchronize { @next_control_at = [@next_control_at.to_f, monotonic + interval].min }
+            retry_after = 0
+            Array(data["sessions"]).each do |status|
+              next unless status.is_a?(Hash)
+              if status["accepted"] == true
+                seconds = status["lease_until"] ? status["lease_until"].to_f - data["time"].to_f : lease
+                renew_local_lease(status["id"].to_s, seconds: seconds, started_at: started_at)
+                next
+              end
+              if status["retryable"] == true
+                retry_after = [retry_after, status["retry_after"].to_f, 1].max
+                next
+              end
+              session = @mutex.synchronize { @sessions[status["id"].to_s] }
+              session&.close_local((status["reason"] || "expired").to_sym)
+            end
+            Array(data["envelopes"]).each { |envelope| enqueue_envelope(envelope) }
+            request_control if data["has_more"] == true
+            if retry_after.positive?
+              control_failed(Error.new("Live session control temporarily unavailable"), retry_after: retry_after)
+            end
+          rescue JSON::ParserError, TypeError => error
+            control_failed(error)
           end
         end
       rescue ThreadError
         nil
-      rescue JSON::ParserError, TypeError
-        request_control(CONTROL_RETRY_INTERVAL)
+      end
+
+      def renew_local_lease(id, seconds: nil, started_at: nil)
+        seconds ||= @limits.fetch("member_lease_seconds", 30).to_f
+        @mutex.synchronize do
+          @lease_deadlines[id] = [@lease_deadlines[id].to_f, (started_at || monotonic) + seconds].max if @sessions.key?(id)
+        end
+      end
+
+      def cancel_control
+        pending = @control_pending
+        @control_pending = nil
+        pending[:cancellation]&.cancel if pending
+      end
+
+      def control_failed(error, retry_after: nil)
+        @control_failures += 1
+        advertised = retry_after || (error.retry_after if error.respond_to?(:retry_after))
+        delay = [[2**[@control_failures - 1, 3].min, 5].min, advertised.to_f].max
+        @retry_not_before = monotonic + delay
+        @mutex.synchronize { @next_control_at = @retry_not_before }
+        record_error(error)
       end
 
       def request_control(delay = 0)
@@ -701,12 +953,32 @@ module EltenAPI
         true
       end
 
-      def tick
+      def tick(dispatch: true)
         current = mutex.synchronize do
           cleanup_pending
           endpoints.dup
         end
-        current.each(&:tick)
+        current.each do |endpoint|
+          begin
+            endpoint.protocol_tick
+          rescue StandardError => error
+            endpoint.record_error(error)
+          end
+        end
+        if dispatch && !@dispatching
+          @dispatching = true
+          begin
+            current.each(&:dispatch_events)
+          ensure
+            @dispatching = false
+          end
+        end
+        true
+      end
+
+      def reconnect
+        current = mutex.synchronize { endpoints.dup }
+        current.each { |endpoint| endpoint.__send__(:request_control) }
         true
       end
 

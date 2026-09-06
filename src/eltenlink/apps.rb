@@ -373,7 +373,7 @@ module EltenLink
         true
       end
 
-      def send_live_session(client, session_id:, participant_id:, packet:, message_id:)
+      def send_live_session(client, session_id:, participant_id:, packet:, message_id:, timeout: Client::DEFAULT_TIMEOUT, cancellation_token: nil)
         client.api_data(
           "POST",
           "#{live_session_path(session_id)}/messages",
@@ -381,7 +381,8 @@ module EltenLink
             "participant_id" => participant_id,
             "message_id" => message_id,
             "packet" => packet
-          }
+          },
+          timeout: timeout, cancellation_token: cancellation_token
         )
       end
 

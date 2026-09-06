@@ -659,7 +659,10 @@ module EltenAPI
         @stream_fast_reconnect = false
         @stream_ever_connected = true
         @next_stream_control_at ||= monotonic_time
-        @stream_state = {} if frame["full"] == true
+        if frame["full"] == true
+          @stream_state = {}
+          EltenAPI::LiveSessions.reconnect if defined?(EltenAPI::LiveSessions)
+        end
         transient = %w[signals live_sessions wn wn_cursor wn_has_more notifications_state]
         data.each { |name, value| @stream_state[name] = value unless transient.include?(name) }
         response = @stream_state.merge(
