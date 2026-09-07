@@ -182,6 +182,12 @@ module GlobalMenu
               $restart=true
               $scene=Scene_Loading.new
     }
+    m.option(p_("MainMenu", "Restart in &normal mode")) {
+                                  play_sound("logout")
+              if !restart_to_normal_mode
+                alert(p_("MainMenu", "Cannot restart in normal mode."))
+              end
+    }
     end
     }
     if ($subthreads||[]).size>0 || $mainthread!=$currentthread
