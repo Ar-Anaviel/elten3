@@ -930,7 +930,7 @@ module NotificationGroups
     when "blogfollower"
       Proc.new { insert_scene(Scene_Blog_Followers.new(nil), true, return_to_main: true) }
     when "friend"
-      Proc.new { insert_scene(Scene_Users_AddedMeToContacts.new(true), true) }
+      Proc.new { insert_scene(Scene_Users_AddedMeToContacts.new(true, Scene_Main.new), true, return_to_main: true) }
     when "birthday"
       Proc.new { open_birthday(payload) }
     when "groupinvitation"
