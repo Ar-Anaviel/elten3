@@ -5,8 +5,9 @@
 # You should have received a copy of the GNU General Public License along with Elten. If not, see <https://www.gnu.org/licenses/>. 
 
 class Scene_Users_AddedMeToContacts
-  def initialize(new=false)
+  def initialize(new=false, scene=nil)
     @new=new
+    @scene=scene
     end
   def main
     unless Session.logged?
@@ -40,11 +41,7 @@ loop_update
         rescue EltenLink::Error => e
           Log.warning("Users added me acknowledgement failed: #{e.message}")
         end
-        if @new==false
-        $scene = Scene_Main.new
-      else
-        $scene=Scene_Notifications.new
-        end
+        $scene = @scene || Scene_Main.new
         break
       end
       if key_pressed?(:key_enter)
