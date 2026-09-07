@@ -112,11 +112,12 @@ module EltenAPI
       $speechid=id
       swait=false
       method=stop ? 1 : 0
-                  if $speech_wait==true
-      method=0
-      $speech_wait=false
-      swait=true
-      speech_wait if !speech_output_nvda?
+      protected_speech = ($speech_wait == true) || (defined?($speech_protected_until) && $speech_protected_until && Time.now.to_f < $speech_protected_until)
+      if protected_speech
+        method = 0
+        $speech_wait = false
+        $speech_protected_until = 0
+        swait = true
     end
             output=speech_output
             output.set_paused(false) if text!=nil and text!="" and method!=0 and output.pause_supported?
@@ -173,23 +174,25 @@ def speak_sequence(seq, pan: 50, limit: nil)
   $speechid=seq.id if seq.respond_to?(:id)
   output=speech_output
   nvda = nvda_output
-  if nvda != nil && output == nvda && !nvda.check
+  protected_speech = ($speech_wait == true) || (defined?($speech_protected_until) && $speech_protected_until && Time.now.to_f < $speech_protected_until)
+  $speech_wait = false
+  $speech_protected_until = 0 if protected_speech
+  if nvda != nil && output == nvda
     seq.reset
     seq.start(pan)
-    output.speak_sequence(seq)
+    if protected_speech
+      output.speak_text(seq.text, method: 0, interrupt: false)
+    else
+      output.speak_sequence(seq)
+    end
     @@current_speechsequence=seq
     return
-  elsif nvda != nil && output == nvda
+  else
     seq.reset
     seq.start(pan)
     output.speak_sequence(seq)
     @@current_speechsequence=seq
-  else
-    seq.reset
-seq.start(pan)
-output.speak_sequence(seq)
-@@current_speechsequence=seq    
-end
+  end
   end
 
                              def speech_getindex
@@ -218,6 +221,7 @@ def speech_actived(ignoreaudio=false)
   def speech_stop(audio=true)
     Programs.emit_event(:speech_stop)
         $speech_wait=false
+    $speech_protected_until = 0
     @@current_speechsequence=nil
       speech_output.stop
   
@@ -226,14 +230,18 @@ def speech_actived(ignoreaudio=false)
   # Waits for a speech to finish reading of the previous message
       def speech_wait
         if !speech_output_nvda?
-    while speech_actived == true
-loop_update(false)
-end
-else
-  $speech_wait = true
-  end
-  return
-end
+          while speech_actived == true
+            loop_update(false)
+          end
+        else
+          $speech_wait = true
+          rate = (Configuration.voicerate rescue 50).to_f
+          rate = 50.0 if rate <= 0
+          speed = (18.0 * (rate / 50.0)).clamp(8.0, 50.0)
+          $speech_protected_until = Time.now.to_f + (($speech_lasttext.to_s.strip.length / speed) + 0.35)
+        end
+        return
+      end
 
 # Returns the character dictionary name
 #

@@ -489,6 +489,7 @@ end
         return 0
       end
       return 1 if !remote_running?
+      stop if interrupt && method != 0
       remote_speak_text.call(wide(text), method.to_i)
     rescue Exception
       1
