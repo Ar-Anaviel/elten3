@@ -79,6 +79,7 @@ src/eapi/conference.rb
 src/scenes/account.rb
 src/scenes/keyboardshortcuts.rb
 src/scenes/settings.rb
+src/scenes/spellcheckdictionary.rb
 src/scenes/clock.rb
 src/scenes/programs.rb
 src/scenes/palantiri.rb
@@ -150,6 +151,7 @@ src/platforms/windows/eapi/sapi.rb :windows
 src/platforms/windows/eapi/spellcheck.rb :windows
 src/platforms/osx/eapi/spellcheck.rb :osx
 src/platforms/linux/eapi/spellcheck.rb :linux
+src/eapi/spellcheckdictionary.rb
 src/platforms/osx/eapi/childprocess.rb :osx
 src/platforms/linux/eapi/childprocess.rb :linux
 src/eapi/external.rb

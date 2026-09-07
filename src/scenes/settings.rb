@@ -355,6 +355,7 @@ def make_window
         make_setting(p_("Settings", "Speech pitch"), (0..100).to_a.reverse.map{|x|x.to_s+"%"}, "Voice", "Pitch", (0..100).to_a.reverse)
         make_setting(p_("Settings", "Enable braille output"), :bool, "Interface", "EnableBraille") if SpeechOutput.list.any?{|output| output.braille_supported?}
         make_setting(p_("Settings", "Use a voice dictionary when processing characters (requires the NVDA add-on when using NVDA for speech output)"), :bool, "Voice", "UseVoiceDictionary")
+        make_setting(p_("Settings", "Manage the spell check dictionary"), :custom, Proc.new{insert_scene(Scene_SpellCheckDictionary.new)})
                         make_setting(p_("Settings", "Typing echo"), [p_("Settings", "Characters"),p_("Settings", "Words"),p_("Settings", "Characters and words"),p_("Settings", "None")], "Interface", "TypingEcho", ["characters", "words", "characters_and_words", "none"])
         on_load {
         voice_output=Proc.new {

@@ -644,7 +644,7 @@ def espellcheck
   form.fields[1...-2]=[]
   form.show_all
   errors=SpellCheck.check(langs[lst_languages.index], @text)
-  errors=errors.reject{|e|dictionary_match?(splt[e.index...(e.index+e.length)])}
+  errors=errors.reject{|e|SpellCheckDictionary.match?(splt[e.index...(e.index+e.length)])}
   for error in errors
         phr=splt[error.index...(error.index+error.length)]
         frgb=-1
@@ -746,7 +746,7 @@ def dictionary_add_dialog(word)
     dform.cancel_button=btn_cancel
     btn_cancel.on(:press) {dform.resume}
     btn_save.on(:press) {
-      case dictionary_add(dpat.text, match_type: dtype.index, case_sensitive: dcase.value)
+      case SpellCheckDictionary.add(dpat.text, match_type: dtype.index, case_sensitive: dcase.value)
       when :added
         result=true
         dform.resume
@@ -766,64 +766,6 @@ def dictionary_add_dialog(word)
   end
   result
   end
-def dictionary_parse(entry, default_type)
-  entry=entry.to_s
-  if entry=~/\A([01])([war])\|(.*)\z/m
-    [$1=="1", $2, $3]
-  elsif entry=~/\A([01])\|(.*)\z/m
-    [$1=="1", default_type, $2]
-  else
-    [true, default_type, entry]
-  end
-end
-def dictionary_add(pattern, match_type: 0, case_sensitive: false)
-  type=["w","a","r"][match_type]||"w"
-  pattern=pattern.to_s
-  pattern=pattern.strip unless type=="r"
-  return :empty if pattern==""
-  if type=="r"
-    begin
-      Regexp.new(pattern)
-    rescue Exception
-      return :invalid
-    end
-  end
-  ic=case_sensitive!=true
-  entry=(ic ? "1" : "0")+type+"|"+pattern
-  list=LocalConfig["SpellCheckCustomWords", [], type: :array_of_strings]
-  return :duplicate if list.include?(entry)
-  list.push(entry)
-  LocalConfig["SpellCheckCustomWords"]=list
-  :added
-end
-def dictionary_match_entry?(entry, default_type, word)
-  ic, type, val = dictionary_parse(entry, default_type)
-  return false if val==""
-  case type
-  when "a"
-    ic ? word.downcase.include?(val.downcase) : word.include?(val)
-  when "r"
-    begin
-      re = ic ? Regexp.new(val, Regexp::IGNORECASE) : Regexp.new(val)
-      re.match?(word)
-    rescue Exception
-      false
-    end
-  else
-    ic ? val.casecmp?(word) : val==word
-  end
-end
-def dictionary_match?(word)
-  word=word.to_s
-  return false if word==""
-  LocalConfig["SpellCheckCustomWords", [], type: :array_of_strings].each do |entry|
-    return true if dictionary_match_entry?(entry, "w", word)
-  end
-  LocalConfig["SpellCheckCustomRegexps", [], type: :array_of_strings].each do |entry|
-    return true if dictionary_match_entry?(entry, "r", word)
-  end
-  false
-end
 def copy
       Clipboard.text = get_check.gsub("\n","\r\n")
     alert(p_("EAPI_Form", "copied"), false)
