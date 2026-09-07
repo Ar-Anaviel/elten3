@@ -669,7 +669,7 @@ def espellcheck
       options.push(opt)
     end
     label=phr+" "+letphr+": "+frg
-    lst = ListBox.new([p_("EAPI_Form", "Ignore"), p_("EAPI_Form", "Add to dictionary")]+options+[p_("EAPI_Form", "Use custom text")], header: label)
+    lst = ListBox.new([p_("EAPI_Form", "Ignore")]+options+[p_("EAPI_Form", "Add to dictionary"), p_("EAPI_Form", "Use custom text")], header: label)
 edt = EditBox.new(label, type: 0, text: phr)
 lst.on(:move) {
 for i in 0...errors.size
@@ -698,13 +698,13 @@ for i in 0...errors.size
   for i in 0...errors.size
     l=form.fields[1+i*2]
     idx=l.index
-    if idx==1
+    if idx==l.options.size-2
       word=(@text||"")[errors[i].index, errors[i].length]||""
       added+=1 if dictionary_add_dialog(word)
-    elsif idx>1
+    elsif idx>0
       corr=""
       if idx<l.options.size-1
-      corr=errors[i].suggestions[idx-2]
+      corr=errors[i].suggestions[idx-1]
     else
       corr=form.fields[1+i*2+1].text
       end
