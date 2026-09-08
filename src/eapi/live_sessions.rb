@@ -45,6 +45,10 @@ module EltenAPI
 
     Message = Struct.new(:id, :sequence, :sender, :packet, keyword_init: true) do
       attr_accessor :metadata
+
+      def regular?
+        metadata&.regular? == true
+      end
     end
 
     class MessageMetadata
@@ -85,7 +89,14 @@ module EltenAPI
           @operation = pool["operation"].to_sym
           @pool_id = pool["id"].dup.freeze
         end
+        @regular = @origin == :participant && @kind == :message &&
+          [nil, "participant"].include?(envelope["origin"]) && [nil, "public"].include?(envelope["visibility"]) &&
+          [nil, "message"].include?(envelope["kind"]) && [nil, "message"].include?(envelope["type"])
         freeze
+      end
+
+      def regular?
+        @regular
       end
 
       def private?
