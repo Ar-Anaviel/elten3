@@ -27,6 +27,7 @@ module EltenAPI
     class StackPacketTooLarge < Error; end
     class StackFull < Error; end
     class StackUnsupported < Error; end
+    class DiscoveryUnsupported < Error; end
 
     Message = Struct.new(:id, :sequence, :sender, :packet, keyword_init: true)
 
@@ -79,6 +80,16 @@ module EltenAPI
         @mutex.synchronize { @items.clear; @bytes = 0 }
       end
 
+      def delete_if
+        @mutex.synchronize do
+          @items.delete_if do |item, bytes|
+            remove = yield(item)
+            @bytes -= bytes if remove
+            remove
+          end
+        end
+      end
+
       def size
         @mutex.synchronize { @items.length }
       end
@@ -106,8 +117,68 @@ module EltenAPI
       end
     end
 
+    def self.immutable_copy(value)
+      case value
+      when Hash
+        value.each_with_object({}) { |(key, item), result| result[immutable_copy(key)] = immutable_copy(item) }.freeze
+      when Array
+        value.map { |item| immutable_copy(item) }.freeze
+      when String
+        value.dup.freeze
+      else
+        value
+      end
+    end
+
+    class DiscoveryPage
+      include Enumerable
+      attr_reader :items, :next_cursor, :limits
+
+      def initialize(endpoint, data)
+        @items = Array(data["items"]).map { |entry| DiscoveredSession.new(endpoint, entry) }.freeze
+        @next_cursor = data["next_cursor"]
+        @limits = LiveSessions.immutable_copy(data["limits"] || {})
+      end
+
+      def each(&block)
+        @items.each(&block)
+      end
+    end
+
+    class DiscoveredSession
+      attr_reader :id, :visibility, :discovery_metadata, :created_at, :state, :capacity, :participant_count,
+        :available_slots, :can_join, :join_reason, :invitation, :discovery_context, :discovery_token_expires_at, :limits
+      alias can_join? can_join
+
+      def initialize(endpoint, data)
+        @endpoint = endpoint
+        @id = data["id"].to_s
+        @visibility = data["visibility"].to_s.to_sym
+        @state = data["state"].to_s.to_sym
+        @discovery_metadata = LiveSessions.immutable_copy(data["discovery_metadata"] || {})
+        @created_at, @capacity = data["created_at"].to_i, data["capacity"].to_i
+        @participant_count, @available_slots = data["participant_count"].to_i, data["available_slots"].to_i
+        @can_join = data["can_join"] == true
+        @join_reason = data["join_reason"]&.to_sym
+        @invitation = LiveSessions.immutable_copy(data["invitation"])
+        @discovery_context = LiveSessions.immutable_copy(data["discovery_context"] || {})
+        @discovery_token = data["discovery_token"].to_s
+        @discovery_token_expires_at = data["discovery_token_expires_at"].to_i
+        @limits = LiveSessions.immutable_copy(data["limits"] || {})
+      end
+
+      def join(participant_metadata: {}, timeout: 45, cancellation_token: nil)
+        @endpoint.join_discovered_session(@id, @discovery_token, participant_metadata,
+          timeout: timeout, cancellation_token: cancellation_token)
+      end
+
+      def inspect
+        "#<#{self.class} id=#{@id.inspect} visibility=#{@visibility.inspect}>"
+      end
+    end
+
     class Invitation
-      attr_reader :id, :metadata, :invitation_metadata, :inviter, :capacity, :expires_at
+      attr_reader :id, :metadata, :invitation_metadata, :inviter, :capacity, :expires_at, :invitation_id, :generation, :discovery_context
 
       def initialize(endpoint, data)
         @endpoint = endpoint
@@ -118,6 +189,9 @@ module EltenAPI
         @capacity = data["capacity"].to_i
         @expires_at = data["expires_at"].to_i
         @state = :pending
+        @invitation_id = data["invitation_id"]
+        @generation = data["generation"].to_i
+        @discovery_context = LiveSessions.immutable_copy(data["discovery_context"] || { "via" => "invitation", "sources" => ["invited"] })
       end
 
       def accept(participant_metadata: {})
@@ -134,6 +208,14 @@ module EltenAPI
         true
       end
 
+      def supersede
+        @state = :superseded
+      end
+
+      def superseded?
+        @state == :superseded
+      end
+
       def pending?
         @state == :pending && !expired?
       end
@@ -147,7 +229,8 @@ module EltenAPI
       MISSING_PACKET = Object.new.freeze
       private_constant :MISSING_PACKET
 
-      attr_reader :id, :metadata, :capacity, :owner_id, :participant_id, :state, :limits
+      attr_reader :id, :metadata, :capacity, :owner_id, :participant_id, :state, :limits,
+        :visibility, :join_code, :discovery_metadata, :discovery_context, :join_context
 
       def initialize(endpoint, data)
         @endpoint = endpoint
@@ -570,6 +653,12 @@ module EltenAPI
           @id = (data["id"] || data["session_id"] || @id).to_s
           @metadata = data["metadata"] if data["metadata"].is_a?(Hash)
           @metadata ||= {}
+          @visibility = (data["visibility"] || @visibility || :private).to_sym
+          @join_code = data["join_code"] if data.key?("join_code")
+          @discovery_metadata = LiveSessions.immutable_copy(data["discovery_metadata"]) if data["discovery_metadata"].is_a?(Hash)
+          @discovery_metadata ||= {}.freeze
+          @discovery_context ||= LiveSessions.immutable_copy(data["discovery_context"]) if data["discovery_context"].is_a?(Hash)
+          @join_context ||= LiveSessions.immutable_copy(data["join_context"]) if data["join_context"].is_a?(Hash)
           @capacity = data["capacity"].to_i if data.key?("capacity")
           @owner_id = data["owner_id"].to_s unless data["owner_id"].to_s.empty?
           @participant_id = data["participant_id"].to_s unless data["participant_id"].to_s.empty?
@@ -701,30 +790,68 @@ module EltenAPI
         LiveSessions.register(self)
       end
 
-      def create(metadata: {}, participant_metadata: {}, capacity: 2, stack_entry_bytes: DEFAULT_STACK_ENTRY_BYTES, stack_entries: DEFAULT_STACK_ENTRIES)
+      def create(metadata: {}, participant_metadata: {}, capacity: 2, visibility: :private, join_code: nil, discovery_metadata: {}, timeout: 45, cancellation_token: nil, stack_entry_bytes: DEFAULT_STACK_ENTRY_BYTES, stack_entries: DEFAULT_STACK_ENTRIES)
         ensure_open!
         [stack_entry_bytes, stack_entries].each do |value|
           raise ArgumentError, "Stack limits must be positive integers" unless value.is_a?(Integer) && value.positive?
         end
-        data = EltenLink::Apps.create_live_session(
-          @client,
-          appid: @app_id,
-          instance_id: @instance_id,
-          metadata: metadata,
-          participant_metadata: participant_metadata,
-          capacity: capacity, stack_entry_bytes: stack_entry_bytes, stack_entries: stack_entries
-        )
-        store_session(data)
+        visibility = visibility.to_s
+        raise ArgumentError, "Invalid session visibility" unless %w[private public].include?(visibility)
+        join_code = normalize_join_code(join_code) unless join_code.nil?
+        raise ArgumentError, "discovery_metadata must be a Hash" unless discovery_metadata.is_a?(Hash)
+        maximum = @limits.fetch("max_discovery_metadata_bytes", 1024).to_i
+        raise ArgumentError, "Discovery metadata exceeds #{maximum} bytes" if JSON.generate(discovery_metadata).bytesize > maximum
+        data = discovery_request(:create,
+          { "metadata" => metadata, "participant_metadata" => participant_metadata, "capacity" => capacity,
+            "visibility" => visibility, "join_code" => join_code, "discovery_metadata" => discovery_metadata,
+            "stack_entry_bytes" => stack_entry_bytes, "stack_entries" => stack_entries },
+          timeout: timeout, cancellation_token: cancellation_token, retries: 0)
+        session = store_session(data)
+        if (visibility != "private" || join_code || !discovery_metadata.empty?) && session.limits["discovery"] != true
+          session.close_local(:unsupported)
+          raise DiscoveryUnsupported, "Server does not support live session discovery"
+        end
+        session
       end
 
-      def connect(user, metadata: {}, participant_metadata: {}, capacity: 2, timeout: 10, stack_entry_bytes: DEFAULT_STACK_ENTRY_BYTES, stack_entries: DEFAULT_STACK_ENTRIES)
-        session = create(metadata: metadata, participant_metadata: participant_metadata, capacity: capacity, stack_entry_bytes: stack_entry_bytes, stack_entries: stack_entries)
+      def connect(user, metadata: {}, participant_metadata: {}, capacity: 2, timeout: 10, stack_entry_bytes: DEFAULT_STACK_ENTRY_BYTES, stack_entries: DEFAULT_STACK_ENTRIES, visibility: :private, join_code: nil, discovery_metadata: {})
+        session = create(metadata: metadata, participant_metadata: participant_metadata, capacity: capacity,
+          stack_entry_bytes: stack_entry_bytes, stack_entries: stack_entries, visibility: visibility, join_code: join_code, discovery_metadata: discovery_metadata)
         session.invite(user)
         session.wait_for_participant(user, timeout: timeout)
         session
       rescue Exception
         session&.close rescue nil
         raise
+      end
+
+      def discover_sessions(sources: [:created, :invited, :public], limit: 50, cursor: nil, timeout: 45, cancellation_token: nil)
+        sources = Array(sources).map(&:to_s).uniq
+        raise ArgumentError, "Invalid discovery sources" if sources.empty? || !(sources - %w[created invited public]).empty?
+        raise ArgumentError, "limit must be a positive integer" unless limit.is_a?(Integer) && limit.positive?
+        unless cursor.nil? || (cursor.is_a?(String) && cursor.match?(/\A[A-Za-z0-9_-]{16,64}\z/))
+          raise ArgumentError, "Invalid discovery cursor"
+        end
+        limit = [limit, @limits["max_discovery_page_size"].to_i].min if @limits["max_discovery_page_size"].to_i.positive?
+        params = { "sources" => sources.join(","), "limit" => limit }
+        params["cursor"] = cursor unless cursor.nil?
+        data = discovery_request(:discover_sessions, params, timeout: timeout, cancellation_token: cancellation_token)
+        DiscoveryPage.new(self, data)
+      end
+
+      def find_by_code(code, timeout: 45, cancellation_token: nil)
+        data = discovery_request(:find_by_code, { "code" => normalize_join_code(code) }, timeout: timeout, cancellation_token: cancellation_token)
+        DiscoveredSession.new(self, data)
+      end
+
+      def join_discovered_session(id, discovery_token, participant_metadata, timeout: 45, cancellation_token: nil)
+        data = discovery_request(:join, { "discovery_token" => discovery_token, "participant_metadata" => participant_metadata },
+          session_id: id, timeout: timeout, cancellation_token: cancellation_token)
+        if data.dig("join_context", "method") == "invitation"
+          resolve_invitation(id, invitation_id: data.dig("join_context", "invitation_id"),
+            generation: data.dig("join_context", "invitation_generation"))
+        end
+        store_session(data)
       end
 
       def sessions
@@ -736,7 +863,12 @@ module EltenAPI
       end
 
       def next_invitation(timeout: nil, cancellation_token: nil)
-        @invitation_queue.pop(timeout: timeout, cancellation_token: cancellation_token, pump: -> { wait_step(cancellation_token: cancellation_token) })
+        deadline = timeout.nil? ? nil : monotonic + [timeout.to_f, 0].max
+        loop do
+          remaining = deadline.nil? ? nil : [deadline - monotonic, 0].max
+          invitation = @invitation_queue.pop(timeout: remaining, cancellation_token: cancellation_token, pump: -> { wait_step(cancellation_token: cancellation_token) })
+          return invitation if invitation.nil? || invitation.pending?
+        end
       end
 
       def closed?
@@ -778,21 +910,15 @@ module EltenAPI
 
       def accept_invitation(invitation, participant_metadata)
         ensure_open!
-        data = EltenLink::Apps.accept_live_session(
-          @client,
-          session_id: invitation.id,
-          appid: @app_id,
-          instance_id: @instance_id,
-          participant_metadata: participant_metadata
-        )
-        resolve_invitation(invitation.id)
+        data = discovery_request(:accept, { "participant_metadata" => participant_metadata, "invitation_id" => invitation.invitation_id }, session_id: invitation.id)
+        resolve_invitation(invitation.id, invitation_id: invitation.invitation_id, generation: invitation.generation)
         store_session(data)
       end
 
       def reject_invitation(invitation)
         ensure_open!
-        EltenLink::Apps.reject_live_session(@client, session_id: invitation.id, appid: @app_id)
-        resolve_invitation(invitation.id)
+        discovery_request(:reject, { "invitation_id" => invitation.invitation_id }, session_id: invitation.id)
+        resolve_invitation(invitation.id, invitation_id: invitation.invitation_id, generation: invitation.generation)
         true
       end
 
@@ -852,34 +978,13 @@ module EltenAPI
 
       def stack_request(session, operation, params, retries: 2, timeout: 120, cancellation_token: nil, check_capacity: false)
         request = queue_stack_request(session, operation, params, retries: retries, timeout: timeout, check_capacity: check_capacity)
-        loop do
-          cancellation_token&.raise_if_cancelled!
-          begin
-            value, error = request[:result].pop(true)
-            raise error if error
-            return value
-          rescue ThreadError
-            raise TimeoutError, "Live session stack request timed out" if monotonic >= request[:deadline]
-            wait_step(cancellation_token: cancellation_token)
-          end
-        end
-      ensure
-        cancel_stack_request(request) if request
+        await_live_request(request, cancellation_token: cancellation_token)
       end
 
       def queue_stack_request(session, operation, params, retries: 2, timeout: 120, check_capacity: false)
         ensure_session!(session)
         raise StackUnsupported, "Server does not support live session stacks" unless session.limits["stack"] == true
-        timeout = Float(timeout)
-        raise ArgumentError, "timeout must be positive and finite" unless timeout.finite? && timeout.positive?
-        token = EltenAPI::Tasks::CancellationToken.new if defined?(EltenAPI::Tasks::CancellationToken)
-        request = { session: session, operation: operation, params: params, attempts: 0, retries: [[retries.to_i, 0].max, 2].min,
-          deadline: monotonic + timeout, next_at: monotonic, result: Queue.new, cancellation: token, check_capacity: check_capacity }
-        @mutex.synchronize do
-          raise QueueOverflow, "Too many pending stack requests" if @stack_requests.length >= MAX_QUEUE_ITEMS
-          @stack_requests << request
-        end
-        request
+        queue_live_request(session, operation, params, retries: retries, timeout: timeout, check_capacity: check_capacity)
       end
 
       def cancel_stack_request(request)
@@ -1050,16 +1155,82 @@ module EltenAPI
 
       private
 
+      def normalize_join_code(code)
+        value = code.is_a?(String) ? code.strip.upcase : ""
+        minimum = @limits.fetch("min_join_code_length", 6).to_i
+        maximum = @limits.fetch("max_join_code_length", 32).to_i
+        unless value.match?(/\A[A-Z0-9-]+\z/) && value.bytesize.between?(minimum, maximum)
+          raise ArgumentError, "Session code must contain #{minimum} to #{maximum} ASCII letters, digits or hyphens"
+        end
+        value
+      end
+
+      def discovery_request(operation, params, session_id: nil, timeout: 45, cancellation_token: nil, retries: 2)
+        ensure_open!
+        params = JSON.parse(JSON.generate(params.merge("appid" => @app_id, "instance_id" => @instance_id)))
+        http = EltenLink::Apps.live_session_discovery_request(operation, params, session_id: session_id)
+        request = queue_live_request(nil, operation, params, timeout: timeout, retries: retries, http: http)
+        result = await_live_request(request, cancellation_token: cancellation_token)
+        @limits = result["limits"] if result["limits"].is_a?(Hash)
+        result
+      end
+
+      def queue_live_request(session, operation, params, retries:, timeout:, check_capacity: false, http: nil)
+        ensure_open!
+        timeout = Float(timeout)
+        raise ArgumentError, "timeout must be positive and finite" unless timeout.finite? && timeout.positive?
+        token = EltenAPI::Tasks::CancellationToken.new if defined?(EltenAPI::Tasks::CancellationToken)
+        request = { session: session, operation: operation, params: params, http: http, attempts: 0, retries: [[retries.to_i, 0].max, 2].min,
+          deadline: monotonic + timeout, next_at: monotonic, result: Queue.new, cancellation: token, check_capacity: check_capacity }
+        @mutex.synchronize do
+          raise SessionClosed, "Live session endpoint is closed" if @closed
+          raise QueueOverflow, "Too many pending live session requests" if @stack_requests.length >= MAX_QUEUE_ITEMS
+          @stack_requests << request
+        end
+        request
+      end
+
+      def await_live_request(request, cancellation_token: nil)
+        loop do
+          cancellation_token&.raise_if_cancelled!
+          begin
+            value, error = request[:result].pop(true)
+            raise error if error
+            return value
+          rescue ThreadError
+            raise TimeoutError, "Live session request timed out" if monotonic >= request[:deadline]
+            wait_step(cancellation_token: cancellation_token)
+          end
+        end
+      ensure
+        cancel_stack_request(request)
+      end
+
+      def stack_request_closed?(request)
+        @closed || request[:session]&.closed?
+      end
+
       def receive_invitation(data)
         invitation = nil
         @mutex.synchronize do
           id = data["session_id"].to_s
-          return if id.empty? || @resolved_invitations.key?(id) || @invitations.key?(id)
+          return if id.empty?
+          identity = data["invitation_id"]
+          generation = data["generation"].to_i
+          resolved = @resolved_invitations[id]
+          return if resolved && (identity.nil? || identity == resolved[:id] || generation <= resolved[:generation])
+          previous = @invitations[id]
+          return if previous && (identity.nil? || identity == previous.invitation_id || generation <= previous.generation)
+          previous&.supersede
           invitation = Invitation.new(self, data)
           @invitations[id] = invitation
         end
-        @invitation_queue << invitation
-        emit(:invitation, invitation)
+        @invitation_queue.delete_if { |entry| entry.superseded? || entry.expired? }
+        @invitation_queue << invitation unless invitation.superseded?
+        callbacks = @mutex.synchronize { @callbacks[:invitation].dup }
+        callbacks.each do |callback|
+          enqueue_callback(->(entry) { callback.call(entry) unless entry.superseded? }, invitation)
+        end
       end
 
       def receive_events(data)
@@ -1089,7 +1260,7 @@ module EltenAPI
         pending = @mutex.synchronize do
           existing = @sessions[session.id]
           if existing.nil?
-            @sessions[session.id] = session
+            @sessions[session.id] = session unless @closed
           else
             session = existing
           end
@@ -1098,25 +1269,42 @@ module EltenAPI
           @pending_envelope_bytes -= removed.sum { |item| item[1] }
           removed.map(&:first)
         end
+        if closed?
+          session.close_local(:endpoint_closed)
+          LiveSessions.register(self)
+          raise SessionClosed, "Live session endpoint is closed"
+        end
         pending.each { |envelope| receive_events(envelope) }
         @limits = data["limits"] if data["limits"].is_a?(Hash)
         renew_local_lease(session.id)
         session
       end
 
-      def resolve_invitation(id)
+      def resolve_invitation(id, invitation_id: nil, generation: nil)
         @mutex.synchronize do
-          @invitations.delete(id.to_s)
-          @resolved_invitations[id.to_s] = Time.now.to_i
+          current = @invitations[id.to_s]
+          if current && (invitation_id.nil? || invitation_id == current.invitation_id)
+            generation ||= current.generation
+            @invitations.delete(id.to_s)
+          end
+          previous = @resolved_invitations[id.to_s]
+          if previous.nil? || previous[:generation] <= generation.to_i
+            @resolved_invitations[id.to_s] = { at: Time.now.to_i, id: invitation_id, generation: generation.to_i }
+          end
           @resolved_invitations.shift while @resolved_invitations.length > MAX_PENDING_INVITATIONS
         end
+        discard_resolved_invitation(id, invitation_id)
+      end
+
+      def discard_resolved_invitation(id, invitation_id)
+        @invitation_queue.delete_if { |entry| entry.id == id.to_s && (invitation_id.nil? || entry.invitation_id == invitation_id) }
       end
 
       def expire_invitations
         now = Time.now.to_i
         @mutex.synchronize do
           @invitations.delete_if { |_id, invitation| invitation.expires_at.positive? && invitation.expires_at <= now }
-          @resolved_invitations.delete_if { |_id, time| time < now - 300 }
+          @resolved_invitations.delete_if { |_id, entry| entry[:at] < now - 300 }
         end
       end
 
@@ -1212,27 +1400,29 @@ module EltenAPI
           if error
             retryable = stack_request_retryable?(error)
             delay = [error.respond_to?(:retry_after) ? error.retry_after.to_f : 0, 2**[attempt - 1, 2].min].max
-            if retryable && attempt <= request[:retries] && monotonic + delay < request[:deadline] && !request[:session].closed?
+            if retryable && attempt <= request[:retries] && monotonic + delay < request[:deadline] && !stack_request_closed?(request)
               request[:next_at] = monotonic + delay
               @mutex.synchronize { @stack_requests << request }
             else
               request[:result] << [nil, error]
             end
           else
-            request[:session].apply_stack_state(value["stack"])
-            renew_local_lease(request[:session].id)
+            if request[:session]
+              request[:session].apply_stack_state(value["stack"])
+              renew_local_lease(request[:session].id)
+            end
             request[:result] << [value, nil]
           end
         end
       rescue ThreadError
         now = monotonic
-        if @stack_pending && (@stack_pending[:abandoned] || @stack_pending[:session].closed? || now >= @stack_pending[:deadline])
+        if @stack_pending && (@stack_pending[:abandoned] || stack_request_closed?(@stack_pending) || now >= @stack_pending[:deadline])
           request = @stack_pending
           @stack_pending = nil
           request[:abandoned] = true
           request[:raw].close
           request[:cancellation]&.cancel
-          error = request[:session].closed? ? SessionClosed.new("Live session is closed") : TimeoutError.new("Live session stack request timed out")
+          error = stack_request_closed?(request) ? SessionClosed.new("Live session is closed") : TimeoutError.new("Live session stack request timed out")
           request[:result] << [nil, error]
         end
         if @stack_pending && now >= @stack_pending[:attempt_deadline] && !@stack_pending[:timed_out]
@@ -1244,8 +1434,8 @@ module EltenAPI
         end
         @mutex.synchronize do
           @stack_requests.delete_if do |request|
-            invalid = request[:abandoned] || request[:session].closed? || now >= request[:deadline]
-            request[:result] << [nil, request[:session].closed? ? SessionClosed.new("Live session is closed") : TimeoutError.new("Live session stack request timed out")] if invalid && !request[:abandoned]
+            invalid = request[:abandoned] || stack_request_closed?(request) || now >= request[:deadline]
+            request[:result] << [nil, stack_request_closed?(request) ? SessionClosed.new("Live session is closed") : TimeoutError.new("Live session stack request timed out")] if invalid && !request[:abandoned]
             invalid
           end
         end
@@ -1269,7 +1459,7 @@ module EltenAPI
         attempt = request[:attempts]
         raw = request[:raw] = Queue.new
         cancellation = request[:cancellation]
-        method, path, params = EltenLink::Apps.live_session_stack_request(request[:session].id, request[:session].participant_id, request[:operation], request[:params])
+        method, path, params = request[:http] || EltenLink::Apps.live_session_stack_request(request[:session].id, request[:session].participant_id, request[:operation], request[:params])
         auth = { "name" => @user, "token" => @token }
         if method == "GET" || method == "DELETE"
           path = EltenLink::Client.append_query(path, params.merge(auth))
@@ -1500,6 +1690,8 @@ module EltenAPI
 
       def remember_pending(appid, row)
         bucket = pending[appid]
+        previous = bucket[row["session_id"].to_s]
+        return if previous && previous["generation"].to_i > row["generation"].to_i
         bucket[row["session_id"].to_s] = row
         bucket.shift while bucket.length > MAX_PENDING_INVITATIONS
       end

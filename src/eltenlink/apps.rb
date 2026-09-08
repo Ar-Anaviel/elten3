@@ -417,7 +417,7 @@ module EltenLink
         true
       end
 
-      def create_live_session(client, appid:, instance_id:, metadata: {}, participant_metadata: {}, capacity: 2, stack_entry_bytes: 256, stack_entries: 1024)
+      def create_live_session(client, appid:, instance_id:, metadata: {}, participant_metadata: {}, capacity: 2, visibility: :private, join_code: nil, discovery_metadata: {}, stack_entry_bytes: 256, stack_entries: 1024)
         client.api_data(
           "POST",
           "/api/v1/apps/live-sessions",
@@ -428,7 +428,8 @@ module EltenLink
             "participant_metadata" => participant_metadata,
             "capacity" => capacity,
             "stack_entry_bytes" => stack_entry_bytes,
-            "stack_entries" => stack_entries
+            "stack_entries" => stack_entries,
+            "visibility" => visibility.to_s, "join_code" => join_code, "discovery_metadata" => discovery_metadata
           }
         )
       end
@@ -441,20 +442,20 @@ module EltenLink
         )
       end
 
-      def accept_live_session(client, session_id:, appid:, instance_id:, participant_metadata: {})
+      def accept_live_session(client, session_id:, appid:, instance_id:, participant_metadata: {}, invitation_id: nil)
         client.api_data(
           "POST",
           "#{live_session_path(session_id)}/accept",
           {
             "appid" => appid,
             "instance_id" => instance_id,
-            "participant_metadata" => participant_metadata
+            "participant_metadata" => participant_metadata, "invitation_id" => invitation_id
           }
         )
       end
 
-      def reject_live_session(client, session_id:, appid:)
-        client.api_data("POST", "#{live_session_path(session_id)}/reject", { "appid" => appid })
+      def reject_live_session(client, session_id:, appid:, invitation_id: nil)
+        client.api_data("POST", "#{live_session_path(session_id)}/reject", { "appid" => appid, "invitation_id" => invitation_id })
         true
       end
 
@@ -469,6 +470,22 @@ module EltenLink
           },
           timeout: timeout, cancellation_token: cancellation_token
         )
+      end
+
+      def live_session_discovery_request(operation, params, session_id: nil)
+        path = "/api/v1/apps/live-sessions"
+        case operation
+        when :create
+          ["POST", path, params]
+        when :discover_sessions
+          ["GET", "#{path}/discover", params]
+        when :find_by_code
+          ["POST", "#{path}/resolve-code", params]
+        when :join, :accept, :reject
+          ["POST", "#{live_session_path(session_id)}/#{operation}", params]
+        else
+          raise ArgumentError, "Invalid live session discovery operation"
+        end
       end
 
       def live_session_stack_request(session_id, participant_id, operation, params = {})
