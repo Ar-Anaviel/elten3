@@ -417,7 +417,7 @@ module EltenLink
         true
       end
 
-      def create_live_session(client, appid:, instance_id:, metadata: {}, participant_metadata: {}, capacity: 2, visibility: :private, join_code: nil, discovery_metadata: {}, stack_entry_bytes: 256, stack_entries: 1024)
+      def create_live_session(client, appid:, instance_id:, metadata: {}, participant_metadata: {}, capacity: 2, visibility: :private, join_code: nil, discovery_metadata: {}, stack_entry_bytes: 256, stack_entries: 1024, pool_count: 1)
         client.api_data(
           "POST",
           "/api/v1/apps/live-sessions",
@@ -428,7 +428,7 @@ module EltenLink
             "participant_metadata" => participant_metadata,
             "capacity" => capacity,
             "stack_entry_bytes" => stack_entry_bytes,
-            "stack_entries" => stack_entries,
+            "stack_entries" => stack_entries, "pool_count" => pool_count,
             "visibility" => visibility.to_s, "join_code" => join_code, "discovery_metadata" => discovery_metadata
           }
         )
@@ -486,6 +486,30 @@ module EltenLink
         else
           raise ArgumentError, "Invalid live session discovery operation"
         end
+      end
+
+      def live_session_pool_request(session_id, participant_id, operation, params = {}, pool_id: nil, draw_id: nil)
+        path = "#{live_session_path(session_id)}/pools"
+        [pool_id, draw_id].compact.each do |id|
+          raise ArgumentError, "Invalid pool identifier" unless id.is_a?(String) && id.match?(/\A[A-Za-z0-9_-]{16,64}\z/)
+        end
+        path += "/#{pool_id}" if pool_id
+        method = case operation
+        when :create then "POST"
+        when :list, :state then "GET"
+        when :delete then "DELETE"
+        when :take
+          path += "/take"
+          "POST"
+        when :draws, :draw, :reveal
+          path += "/draws"
+          path += "/#{draw_id}" if draw_id
+          path += "/reveal" if operation == :reveal
+          operation == :reveal ? "POST" : "GET"
+        else
+          raise ArgumentError, "Invalid pool operation"
+        end
+        [method, path, params.merge("participant_id" => participant_id)]
       end
 
       def live_session_random_request(session_id, participant_id, operation, params = {})

@@ -28,6 +28,10 @@ module EltenAPI
     class StackFull < Error; end
     class StackUnsupported < Error; end
     class DiscoveryUnsupported < Error; end
+    class PoolUnsupported < Error; end
+    class PoolLimit < Error; end
+    class PoolExhausted < Error; end
+    class PoolPacketTooLarge < Error; end
     class RandomUnsupported < Error; end
     class RandomPacketTooLarge < Error; end
 
@@ -36,13 +40,14 @@ module EltenAPI
     end
 
     class MessageMetadata
-      attr_reader :id, :sequence, :origin, :created_at, :min, :max, :count, :draw_number
+      attr_reader :id, :sequence, :origin, :created_at, :min, :max, :count, :draw_number, :kind, :operation, :pool_id
 
       def initialize(envelope)
         @id = envelope["message_id"].to_s.dup.freeze
         @sequence = envelope["seq"].to_i
         @created_at = envelope["created_at"]
         @origin = :participant
+        @kind = :message
         if envelope["origin"] == "server"
           random = envelope["random"]
           values = envelope["packet"].is_a?(Hash) && envelope["packet"]["values"]
@@ -52,14 +57,27 @@ module EltenAPI
             values.all? { |value| value.is_a?(Integer) && value.between?(random["min"], random["max"]) }
           raise EltenLink::Error.new("Invalid server random message", code: "invalid_json") unless valid
           @origin = :server
+          @kind = :random
           @min, @max, @count = random.values_at("min", "max", "count")
           @draw_number = random["draw_number"]
+        elsif envelope["origin"] == "server_pool"
+          pool, packet = envelope.values_at("pool", "packet")
+          valid = pool.is_a?(Hash) && packet.is_a?(Hash) && pool["id"].is_a?(String) &&
+            pool["id"] == packet["pool_id"] && %w[create take reveal delete].include?(pool["operation"])
+          raise EltenLink::Error.new("Invalid server pool message", code: "invalid_json") unless valid
+          @origin, @kind = :server, :pool
+          @operation = pool["operation"].to_sym
+          @pool_id = pool["id"].dup.freeze
         end
         freeze
       end
 
       def server_random?
-        @origin == :server
+        @origin == :server && @kind == :random
+      end
+
+      def server_pool?
+        @origin == :server && @kind == :pool
       end
     end
 
@@ -159,6 +177,128 @@ module EltenAPI
         value.dup.freeze
       else
         value
+      end
+    end
+
+    class PoolDraw
+      attr_reader :id, :pool_id, :values, :visibility, :context, :created_at, :revealed_values, :user, :participant_id
+
+      def initialize(pool, data)
+        @pool = pool
+        value = LiveSessions.immutable_copy(data)
+        @id, @pool_id, @values, @context, @created_at, @revealed_values, @user, @participant_id =
+          value.values_at("id", "pool_id", "values", "context", "created_at", "revealed_values", "user", "participant_id")
+        @visibility = value["visibility"].to_s.to_sym
+        freeze
+      end
+
+      def reveal(**options)
+        @pool.reveal(@id, **options)
+      end
+    end
+
+    class PoolDrawPage
+      include Enumerable
+      attr_reader :items, :next_cursor
+
+      def initialize(pool, data)
+        @items = data.fetch("draws").map { |draw| PoolDraw.new(pool, draw) }.freeze
+        @next_cursor = data["next_cursor"]
+        freeze
+      end
+
+      def each(&block)
+        @items.each(&block)
+      end
+    end
+
+    class Pool
+      attr_reader :id
+
+      def initialize(session, id)
+        raise ArgumentError, "Invalid pool_id" unless id.is_a?(String) && id.match?(/\A[A-Za-z0-9_-]{16,64}\z/)
+        @session, @id = session, id.dup.freeze
+      end
+
+      def state(timeout: 45, cancellation_token: nil)
+        @session.pool_request(:state, {}, pool_id: @id, timeout: timeout, cancellation_token: cancellation_token).fetch("pool")
+      end
+
+      def take(count: 1, visibility: :public, context: nil, delivery: :message, message_id: nil, retries: 2, timeout: 45, cancellation_token: nil)
+        params = { "count" => count, "visibility" => visibility.to_s, "context" => context, "delivery" => delivery.to_s,
+          "message_id" => @session.pool_message_id(message_id) }
+        validate_take!(params)
+        snapshot = state(timeout: timeout, cancellation_token: cancellation_token)
+        validator = ->(first = true) { validate_take!(params, snapshot, capacity: message_id.nil? && first) }
+        validator.call
+        data = @session.pool_request(:take, params, pool_id: @id, retries: retries, timeout: timeout,
+          cancellation_token: cancellation_token, validator: validator)
+        PoolDraw.new(self, data.fetch("draw"))
+      end
+
+      def draw(draw_id, timeout: 45, cancellation_token: nil)
+        raise ArgumentError, "Invalid draw_id" unless draw_id.is_a?(String)
+        draw_id = @session.pool_message_id(draw_id)
+        data = @session.pool_request(:draw, {}, pool_id: @id, draw_id: draw_id, timeout: timeout, cancellation_token: cancellation_token)
+        PoolDraw.new(self, data.fetch("draw"))
+      end
+
+      def my_draws(after: 0, limit: 100, timeout: 45, cancellation_token: nil)
+        unless after.is_a?(Integer) && after >= 0 && limit.is_a?(Integer) && limit.between?(1, 100)
+          raise ArgumentError, "Invalid pool draw page"
+        end
+        data = @session.pool_request(:draws, { "after" => after, "limit" => limit }, pool_id: @id, timeout: timeout, cancellation_token: cancellation_token)
+        PoolDrawPage.new(self, data)
+      end
+
+      def reveal(draw_id, values: nil, context: nil, delivery: :message, message_id: nil, retries: 2, timeout: 45, cancellation_token: nil)
+        raise ArgumentError, "Invalid draw_id" unless draw_id.is_a?(String)
+        draw_id = @session.pool_message_id(draw_id)
+        identity = @session.pool_message_id(message_id)
+        unless values.nil? || (values.is_a?(Array) && !values.empty? && values.length <= @session.limits.fetch("max_pool_take_count", 100) &&
+          values.uniq.length == values.length && values.all? { |value| value.is_a?(Integer) })
+          raise ArgumentError, "Invalid reveal values"
+        end
+        @session.validate_pool_context!(context)
+        raise ArgumentError, "Invalid pool delivery" unless %w[message stack].include?(delivery.to_s)
+        taken = draw(draw_id, timeout: timeout, cancellation_token: cancellation_token)
+        raise ArgumentError, "Values do not belong to this draw" if values && !(values - taken.values).empty?
+        chosen = values || (taken.values - taken.revealed_values)
+        packet = { "pool_id" => @id, "draw_id" => draw_id, "values" => chosen }
+        packet["draw_context"] = taken.context unless taken.context.nil?
+        packet["context"] = context unless context.nil?
+        validator = ->(first = true) { @session.validate_pool_publication!(packet, delivery.to_s, capacity: first && message_id.nil? && !(chosen - taken.revealed_values).empty?) }
+        validator.call
+        @session.pool_request(:reveal, { "values" => values, "context" => context, "delivery" => delivery.to_s, "message_id" => identity },
+          pool_id: @id, draw_id: draw_id, retries: retries, timeout: timeout, cancellation_token: cancellation_token, validator: validator)
+      end
+
+      def delete(timeout: 45, cancellation_token: nil)
+        raise NotOwner, "Only the live session owner can delete pools" unless @session.owner?
+        @session.pool_request(:delete, {}, pool_id: @id, timeout: timeout, cancellation_token: cancellation_token)
+        true
+      end
+
+      private
+
+      def validate_take!(params, snapshot = nil, capacity: true)
+        maximum = @session.limits.fetch("max_pool_take_count", 100)
+        count = params["count"]
+        raise ArgumentError, "Invalid pool draw count" unless count.is_a?(Integer) && count.between?(1, maximum)
+        raise ArgumentError, "Invalid pool visibility" unless %w[public private].include?(params["visibility"])
+        raise ArgumentError, "Invalid pool delivery" unless %w[message stack].include?(params["delivery"])
+        @session.validate_pool_context!(params["context"])
+        return unless snapshot
+        raise ArgumentError, "This pool only permits public draws" if params["visibility"] == "private" && !snapshot["private_draws"]
+        raise PoolExhausted, "Not enough pool items" if capacity && count > snapshot["remaining"]
+        packet = { "pool_id" => @id, "draw_id" => params["message_id"], "count" => count,
+          "remaining" => [snapshot["remaining"] - count, 0].max, "visibility" => params["visibility"] }
+        packet["context"] = params["context"] unless params["context"].nil?
+        if params["visibility"] == "public"
+          widest = snapshot.values_at("min", "max").max_by { |value| value.to_s.bytesize }
+          packet["values"] = Array.new(count, widest)
+        end
+        @session.validate_pool_publication!(packet, params["delivery"], capacity: capacity)
       end
     end
 
@@ -344,6 +484,74 @@ module EltenAPI
         validate_stack_push!(encoded.bytesize, capacity: message_id.nil?)
         @endpoint.stack_request(self, :push, { "packet" => JSON.parse(encoded), "message_id" => identity },
           retries: retries, timeout: timeout, cancellation_token: cancellation_token, check_capacity: message_id.nil?)
+      end
+
+      def create_pool(min: nil, max: nil, values: nil, private_draws: true, message_id: nil, retries: 2, timeout: 45, cancellation_token: nil)
+        ensure_pools!
+        raise NotOwner, "Only the live session owner can create pools" unless owner?
+        identity = pool_message_id(message_id)
+        maximum = @limits.fetch("max_pool_items", 32_768)
+        lower = @limits.fetch("min_random_value", -9_007_199_254_740_991)
+        upper = @limits.fetch("max_random_value", 9_007_199_254_740_991)
+        if values.nil?
+          unless min.is_a?(Integer) && max.is_a?(Integer) && min.between?(lower, upper) && max.between?(min, upper) && max - min + 1 <= maximum
+            raise ArgumentError, "Invalid pool range"
+          end
+        elsif !min.nil? || !max.nil? || !values.is_a?(Array) || !values.length.between?(1, maximum) ||
+          values.uniq.length != values.length || !values.all? { |value| value.is_a?(Integer) && value.between?(lower, upper) }
+          raise ArgumentError, "Invalid pool values"
+        end
+        raise ArgumentError, "private_draws must be boolean" unless private_draws == true || private_draws == false
+        if message_id.nil? && pools(timeout: timeout, cancellation_token: cancellation_token).length >= @limits.fetch("max_pools", 1)
+          raise PoolLimit, "Live session pool limit reached"
+        end
+        data = pool_request(:create, { "min" => min, "max" => max, "values" => values, "private_draws" => private_draws, "message_id" => identity },
+          retries: retries, timeout: timeout, cancellation_token: cancellation_token)
+        Pool.new(self, data.fetch("pool").fetch("id"))
+      end
+
+      def pools(timeout: 45, cancellation_token: nil)
+        data = pool_request(:list, {}, timeout: timeout, cancellation_token: cancellation_token)
+        data.fetch("pools").map { |pool| Pool.new(self, pool.fetch("id")) }
+      end
+
+      def pool(id)
+        ensure_pools!
+        Pool.new(self, id)
+      end
+
+      def ensure_pools!
+        ensure_open!
+        raise PoolUnsupported, "Server does not support live session pools" unless @limits["pools"] == true
+      end
+
+      def pool_message_id(value)
+        value ||= SecureRandom.uuid
+        raise ArgumentError, "Invalid message_id" unless value.is_a?(String) && value.match?(/\A[A-Za-z0-9_-]{16,64}\z/)
+        value
+      end
+
+      def validate_pool_context!(context)
+        ensure_pools!
+        maximum = @limits.fetch("max_pool_context_bytes", 256)
+        raise PoolPacketTooLarge, "Pool context exceeds #{maximum} bytes" if JSON.generate(context).bytesize > maximum
+      end
+
+      def validate_pool_publication!(packet, delivery, capacity: true)
+        ensure_pools!
+        bytes = JSON.generate(packet).bytesize
+        if delivery == "stack"
+          raise StackUnsupported, "Server does not support live session stacks" unless @limits["stack"] == true
+          validate_stack_push!(bytes, capacity: capacity)
+        elsif bytes > @limits.fetch("max_message_bytes", 16 * 1024)
+          raise PoolPacketTooLarge, "Pool message exceeds the session message limit"
+        end
+      end
+
+      def pool_request(operation, params, pool_id: nil, draw_id: nil, retries: 2, timeout: 45, cancellation_token: nil, validator: nil)
+        ensure_pools!
+        @endpoint.pool_request(self, operation, params, pool_id: pool_id, draw_id: draw_id, retries: retries, timeout: timeout,
+          cancellation_token: cancellation_token, validator: validator)
       end
 
       def send_random(min:, max:, count: 1, context: nil, message_id: nil, draw_number: nil, retries: 2, timeout: 45, cancellation_token: nil)
@@ -648,7 +856,7 @@ module EltenAPI
                 sender_data = entry["sender"].is_a?(Hash) ? entry["sender"] : {}
                 sender = @participants[entry["sender_id"].to_s] || Participant.new(sender_data)
                 info = MessageMetadata.new(entry)
-                packet = info.server_random? ? LiveSessions.immutable_copy(entry["packet"]) : entry["packet"]
+                packet = info.origin == :server ? LiveSessions.immutable_copy(entry["packet"]) : entry["packet"]
                 @stack_delivery = { sequence: entry["seq"], callbacks: @callbacks[:stack_message].dup,
                   arguments: [sender, packet, info], index: 0 }
               else
@@ -751,7 +959,7 @@ module EltenAPI
           sender_data = event["sender"].is_a?(Hash) ? event["sender"] : {}
           sender = participant(event["sender_id"]) || Participant.new(sender_data)
           info = MessageMetadata.new(event)
-          packet = info.server_random? ? LiveSessions.immutable_copy(event["packet"]) : event["packet"]
+          packet = info.origin == :server ? LiveSessions.immutable_copy(event["packet"]) : event["packet"]
           message = Message.new(
             id: event["message_id"].to_s,
             sequence: event["seq"].to_i,
@@ -879,9 +1087,9 @@ module EltenAPI
         LiveSessions.register(self)
       end
 
-      def create(metadata: {}, participant_metadata: {}, capacity: 2, visibility: :private, join_code: nil, discovery_metadata: {}, timeout: 45, cancellation_token: nil, stack_entry_bytes: DEFAULT_STACK_ENTRY_BYTES, stack_entries: DEFAULT_STACK_ENTRIES)
+      def create(metadata: {}, participant_metadata: {}, capacity: 2, visibility: :private, join_code: nil, discovery_metadata: {}, timeout: 45, cancellation_token: nil, stack_entry_bytes: DEFAULT_STACK_ENTRY_BYTES, stack_entries: DEFAULT_STACK_ENTRIES, pool_count: 1)
         ensure_open!
-        [stack_entry_bytes, stack_entries].each do |value|
+        [stack_entry_bytes, stack_entries, pool_count].each do |value|
           raise ArgumentError, "Stack limits must be positive integers" unless value.is_a?(Integer) && value.positive?
         end
         visibility = visibility.to_s
@@ -893,9 +1101,13 @@ module EltenAPI
         data = discovery_request(:create,
           { "metadata" => metadata, "participant_metadata" => participant_metadata, "capacity" => capacity,
             "visibility" => visibility, "join_code" => join_code, "discovery_metadata" => discovery_metadata,
-            "stack_entry_bytes" => stack_entry_bytes, "stack_entries" => stack_entries },
+            "stack_entry_bytes" => stack_entry_bytes, "stack_entries" => stack_entries, "pool_count" => pool_count },
           timeout: timeout, cancellation_token: cancellation_token, retries: 0)
         session = store_session(data)
+        if pool_count != 1 && session.limits["pools"] != true
+          session.close_local(:unsupported)
+          raise PoolUnsupported, "Server does not support live session pools"
+        end
         if (visibility != "private" || join_code || !discovery_metadata.empty?) && session.limits["discovery"] != true
           session.close_local(:unsupported)
           raise DiscoveryUnsupported, "Server does not support live session discovery"
@@ -903,9 +1115,9 @@ module EltenAPI
         session
       end
 
-      def connect(user, metadata: {}, participant_metadata: {}, capacity: 2, timeout: 10, stack_entry_bytes: DEFAULT_STACK_ENTRY_BYTES, stack_entries: DEFAULT_STACK_ENTRIES, visibility: :private, join_code: nil, discovery_metadata: {})
+      def connect(user, metadata: {}, participant_metadata: {}, capacity: 2, timeout: 10, stack_entry_bytes: DEFAULT_STACK_ENTRY_BYTES, stack_entries: DEFAULT_STACK_ENTRIES, visibility: :private, join_code: nil, discovery_metadata: {}, pool_count: 1)
         session = create(metadata: metadata, participant_metadata: participant_metadata, capacity: capacity,
-          stack_entry_bytes: stack_entry_bytes, stack_entries: stack_entries, visibility: visibility, join_code: join_code, discovery_metadata: discovery_metadata)
+          stack_entry_bytes: stack_entry_bytes, stack_entries: stack_entries, visibility: visibility, join_code: join_code, discovery_metadata: discovery_metadata, pool_count: pool_count)
         session.invite(user)
         session.wait_for_participant(user, timeout: timeout)
         session
@@ -1063,6 +1275,14 @@ module EltenAPI
           participant_id: session.participant_id,
           timeout: CONTROL_TIMEOUT
         )
+      end
+
+      def pool_request(session, operation, params, pool_id: nil, draw_id: nil, retries: 2, timeout: 45, cancellation_token: nil, validator: nil)
+        params = JSON.parse(JSON.generate(params))
+        http = EltenLink::Apps.live_session_pool_request(session.id, session.participant_id, operation, params, pool_id: pool_id, draw_id: draw_id)
+        check = ->(first) { session.ensure_pools!; validator.call(first) if validator }
+        request = queue_live_request(session, :pool, params, retries: retries, timeout: timeout, http: http, validator: check)
+        await_live_request(request, cancellation_token: cancellation_token)
       end
 
       def random_request(session, operation, params, retries: 2, timeout: 45, cancellation_token: nil, check_capacity: false)
@@ -1270,13 +1490,13 @@ module EltenAPI
         result
       end
 
-      def queue_live_request(session, operation, params, retries:, timeout:, check_capacity: false, http: nil)
+      def queue_live_request(session, operation, params, retries:, timeout:, check_capacity: false, http: nil, validator: nil)
         ensure_open!
         timeout = Float(timeout)
         raise ArgumentError, "timeout must be positive and finite" unless timeout.finite? && timeout.positive?
         token = EltenAPI::Tasks::CancellationToken.new if defined?(EltenAPI::Tasks::CancellationToken)
         request = { session: session, operation: operation, params: params, http: http, attempts: 0, retries: [[retries.to_i, 0].max, 2].min,
-          deadline: monotonic + timeout, next_at: monotonic, result: Queue.new, cancellation: token, check_capacity: check_capacity }
+          deadline: monotonic + timeout, next_at: monotonic, result: Queue.new, cancellation: token, check_capacity: check_capacity, validator: validator }
         @mutex.synchronize do
           raise SessionClosed, "Live session endpoint is closed" if @closed
           raise QueueOverflow, "Too many pending live session requests" if @stack_requests.length >= MAX_QUEUE_ITEMS
@@ -1503,7 +1723,7 @@ module EltenAPI
             end
           else
             if request[:session]
-              request[:session].apply_stack_state(value["stack"])
+              request[:session].apply_stack_state(value["stack"], value["limits"])
               renew_local_lease(request[:session].id)
             end
             request[:result] << [value, nil]
@@ -1543,6 +1763,7 @@ module EltenAPI
           index && @stack_requests.delete_at(index)
         end
         return unless request
+        request[:validator]&.call(request[:attempts].zero?)
         if [:random, :stack_random].include?(request[:operation])
           request[:session].validate_random_request!(request[:operation], request[:params], capacity: request[:check_capacity] && request[:attempts].zero?)
         elsif request[:operation] == :push
