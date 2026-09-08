@@ -20,8 +20,9 @@ for s in st
       end
     @soundthemes.push(SoundTheme.new(p_("SoundThemes", "default"), nil))
   loop_update
-    @selt = @soundthemes.map{|s| s.name}
-   @sel = ListBox.new(@selt,header: p_("SoundThemes", "Sound themes"), index: 0, flags: 0, quiet: false)
+    selected_index = @soundthemes.find_index{|theme| soundtheme_selected?(theme)} || @soundthemes.size-1
+    @selt = soundtheme_labels
+   @sel = ListBox.new(@selt,header: p_("SoundThemes", "Sound themes"), index: selected_index, flags: 0, quiet: false)
   @sel.bind_context{|menu|context(menu)}
   loop do
 loop_update
@@ -29,6 +30,15 @@ loop_update
     update
     break if $scene != self or @return == true
           end
+          end
+  def soundtheme_selected?(theme)
+    return Configuration.soundtheme==nil if theme.file==nil
+    File.basename(theme.file, ".elsnd")==Configuration.soundtheme
+  end
+  def soundtheme_labels
+    @soundthemes.map{|theme|
+      soundtheme_selected?(theme) ? p_("SoundThemes", "%{theme} (selected)")%{:theme=>theme.name} : theme.name
+    }
   end
   def update
     $scene = Scene_Main.new if key_pressed?(:key_escape)
@@ -76,6 +86,8 @@ stdownload
             end
             use_soundtheme(theme.file)
                                    writeconfig("Interface", "SoundTheme", Configuration.soundtheme)
+                @selt = soundtheme_labels
+                @sel.options = @selt
                 alert(_("Saved"))
                           return true
                           }
