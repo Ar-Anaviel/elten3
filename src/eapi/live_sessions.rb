@@ -34,13 +34,16 @@ module EltenAPI
     class PoolPacketTooLarge < Error; end
     class RandomUnsupported < Error; end
     class RandomPacketTooLarge < Error; end
+    class PrivateMessagesUnsupported < Error; end
+    class PrivateMessagesDisabled < Error; end
+    class MessagePacketTooLarge < Error; end
 
     Message = Struct.new(:id, :sequence, :sender, :packet, keyword_init: true) do
       attr_accessor :metadata
     end
 
     class MessageMetadata
-      attr_reader :id, :sequence, :origin, :created_at, :min, :max, :count, :draw_number, :kind, :operation, :pool_id
+      attr_reader :id, :sequence, :origin, :created_at, :min, :max, :count, :draw_number, :kind, :operation, :pool_id, :visibility, :recipient_user
 
       def initialize(envelope)
         @id = envelope["message_id"].to_s.dup.freeze
@@ -48,6 +51,14 @@ module EltenAPI
         @created_at = envelope["created_at"]
         @origin = :participant
         @kind = :message
+        @visibility = envelope["visibility"] == "private" ? :private : :public
+        if private?
+          recipient = envelope["recipient_user"]
+          unless recipient.is_a?(String) && !recipient.strip.empty? && recipient.bytesize <= 64
+            raise EltenLink::Error.new("Invalid private message recipient", code: "invalid_json")
+          end
+          @recipient_user = recipient.dup.freeze
+        end
         if envelope["origin"] == "server"
           random = envelope["random"]
           values = envelope["packet"].is_a?(Hash) && envelope["packet"]["values"]
@@ -70,6 +81,10 @@ module EltenAPI
           @pool_id = pool["id"].dup.freeze
         end
         freeze
+      end
+
+      def private?
+        @visibility == :private
       end
 
       def server_random?
@@ -466,6 +481,37 @@ module EltenAPI
         ensure_open!
         validate_json!(packet)
         @endpoint.send_packet(self, packet, message_id: message_id, retries: retries, cancellation_token: cancellation_token)
+      end
+
+      def private_messages?
+        @mutex.synchronize { @private_messages == true }
+      end
+
+      def send_private(recipient_user, packet = MISSING_PACKET, message_id: nil, retries: 2, timeout: 45, cancellation_token: nil, **packet_fields)
+        if packet.equal?(MISSING_PACKET) && !packet_fields.empty?
+          packet = packet_fields
+        elsif packet.equal?(MISSING_PACKET) || !packet_fields.empty?
+          raise ArgumentError, "exactly one packet is required"
+        end
+        unless recipient_user.is_a?(String) && !recipient_user.strip.empty? && recipient_user.strip.bytesize <= 64
+          raise ArgumentError, "Invalid recipient_user"
+        end
+        identity = message_id || SecureRandom.uuid
+        raise ArgumentError, "Invalid message_id" unless identity.is_a?(String) && identity.match?(/\A[A-Za-z0-9_-]{16,64}\z/)
+        encoded = JSON.generate(packet)
+        validate_private_message!(encoded.bytesize)
+        @endpoint.private_request(self, {
+          "recipient_user" => recipient_user.strip, "packet" => JSON.parse(encoded), "message_id" => identity
+        }, retries: retries, timeout: timeout, cancellation_token: cancellation_token)
+      end
+
+      def validate_private_message!(bytes)
+        ensure_open!
+        raise PrivateMessagesUnsupported, "Server does not support private live session messages" unless @limits["private_messages"] == true
+        raise PrivateMessagesDisabled, "Private messages are disabled for this session" unless private_messages?
+        if bytes > @limits.fetch("max_message_bytes", 16 * 1024)
+          raise MessagePacketTooLarge, "Private message exceeds the session message limit"
+        end
       end
 
       def stack_state
@@ -930,6 +976,7 @@ module EltenAPI
           @metadata = data["metadata"] if data["metadata"].is_a?(Hash)
           @metadata ||= {}
           @visibility = (data["visibility"] || @visibility || :private).to_sym
+          @private_messages = data["private_messages"] == true if data.key?("private_messages")
           @join_code = data["join_code"] if data.key?("join_code")
           @discovery_metadata = LiveSessions.immutable_copy(data["discovery_metadata"]) if data["discovery_metadata"].is_a?(Hash)
           @discovery_metadata ||= {}.freeze
@@ -1087,8 +1134,9 @@ module EltenAPI
         LiveSessions.register(self)
       end
 
-      def create(metadata: {}, participant_metadata: {}, capacity: 2, visibility: :private, join_code: nil, discovery_metadata: {}, timeout: 45, cancellation_token: nil, stack_entry_bytes: DEFAULT_STACK_ENTRY_BYTES, stack_entries: DEFAULT_STACK_ENTRIES, pool_count: 1)
+      def create(metadata: {}, participant_metadata: {}, capacity: 2, visibility: :private, join_code: nil, discovery_metadata: {}, timeout: 45, cancellation_token: nil, stack_entry_bytes: DEFAULT_STACK_ENTRY_BYTES, stack_entries: DEFAULT_STACK_ENTRIES, pool_count: 1, private_messages: false)
         ensure_open!
+        raise ArgumentError, "private_messages must be boolean" unless private_messages == true || private_messages == false
         [stack_entry_bytes, stack_entries, pool_count].each do |value|
           raise ArgumentError, "Stack limits must be positive integers" unless value.is_a?(Integer) && value.positive?
         end
@@ -1101,9 +1149,13 @@ module EltenAPI
         data = discovery_request(:create,
           { "metadata" => metadata, "participant_metadata" => participant_metadata, "capacity" => capacity,
             "visibility" => visibility, "join_code" => join_code, "discovery_metadata" => discovery_metadata,
-            "stack_entry_bytes" => stack_entry_bytes, "stack_entries" => stack_entries, "pool_count" => pool_count },
+            "stack_entry_bytes" => stack_entry_bytes, "stack_entries" => stack_entries, "pool_count" => pool_count, "private_messages" => private_messages },
           timeout: timeout, cancellation_token: cancellation_token, retries: 0)
         session = store_session(data)
+        if private_messages && (session.limits["private_messages"] != true || !session.private_messages?)
+          session.close_local(:unsupported)
+          raise PrivateMessagesUnsupported, "Server did not enable private live session messages"
+        end
         if pool_count != 1 && session.limits["pools"] != true
           session.close_local(:unsupported)
           raise PoolUnsupported, "Server does not support live session pools"
@@ -1115,9 +1167,9 @@ module EltenAPI
         session
       end
 
-      def connect(user, metadata: {}, participant_metadata: {}, capacity: 2, timeout: 10, stack_entry_bytes: DEFAULT_STACK_ENTRY_BYTES, stack_entries: DEFAULT_STACK_ENTRIES, visibility: :private, join_code: nil, discovery_metadata: {}, pool_count: 1)
+      def connect(user, metadata: {}, participant_metadata: {}, capacity: 2, timeout: 10, stack_entry_bytes: DEFAULT_STACK_ENTRY_BYTES, stack_entries: DEFAULT_STACK_ENTRIES, visibility: :private, join_code: nil, discovery_metadata: {}, pool_count: 1, private_messages: false)
         session = create(metadata: metadata, participant_metadata: participant_metadata, capacity: capacity,
-          stack_entry_bytes: stack_entry_bytes, stack_entries: stack_entries, visibility: visibility, join_code: join_code, discovery_metadata: discovery_metadata, pool_count: pool_count)
+          stack_entry_bytes: stack_entry_bytes, stack_entries: stack_entries, visibility: visibility, join_code: join_code, discovery_metadata: discovery_metadata, pool_count: pool_count, private_messages: private_messages)
         session.invite(user)
         session.wait_for_participant(user, timeout: timeout)
         session
@@ -1275,6 +1327,15 @@ module EltenAPI
           participant_id: session.participant_id,
           timeout: CONTROL_TIMEOUT
         )
+      end
+
+      def private_request(session, params, retries: 2, timeout: 45, cancellation_token: nil)
+        params = JSON.parse(JSON.generate(params))
+        bytes = JSON.generate(params["packet"]).bytesize
+        http = EltenLink::Apps.live_session_private_request(session.id, session.participant_id, params)
+        check = ->(_first) { session.validate_private_message!(bytes) }
+        request = queue_live_request(session, :private_message, params, retries: retries, timeout: timeout, http: http, validator: check)
+        await_live_request(request, cancellation_token: cancellation_token)
       end
 
       def pool_request(session, operation, params, pool_id: nil, draw_id: nil, retries: 2, timeout: 45, cancellation_token: nil, validator: nil)
