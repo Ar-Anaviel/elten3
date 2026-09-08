@@ -16,7 +16,10 @@ module EltenAPI
     MAX_QUEUE_BYTES = 8 * 1024 * 1024
     MAX_PENDING_INVITATIONS = 128
     DEFAULT_STACK_ENTRY_BYTES = 256
-    DEFAULT_STACK_ENTRIES = 1024
+    DEFAULT_STACK_ENTRIES = 0
+    DEFAULT_POOL_COUNT = 0
+    LEGACY_STACK_ENTRIES = 1024
+    LEGACY_POOL_COUNT = 1
     STACK_MESSAGE_PAGE_SIZE = 128
 
     class Error < StandardError; end
@@ -27,6 +30,8 @@ module EltenAPI
     class StackPacketTooLarge < Error; end
     class StackFull < Error; end
     class StackUnsupported < Error; end
+    class StackDisabled < Error; end
+    class PoolsDisabled < Error; end
     class DiscoveryUnsupported < Error; end
     class PoolUnsupported < Error; end
     class PoolLimit < Error; end
@@ -276,6 +281,7 @@ module EltenAPI
         end
         @session.validate_pool_context!(context)
         raise ArgumentError, "Invalid pool delivery" unless %w[message stack].include?(delivery.to_s)
+        @session.ensure_stack! if delivery.to_s == "stack"
         taken = draw(draw_id, timeout: timeout, cancellation_token: cancellation_token)
         raise ArgumentError, "Values do not belong to this draw" if values && !(values - taken.values).empty?
         chosen = values || (taken.values - taken.revealed_values)
@@ -303,6 +309,7 @@ module EltenAPI
         raise ArgumentError, "Invalid pool visibility" unless %w[public private].include?(params["visibility"])
         raise ArgumentError, "Invalid pool delivery" unless %w[message stack].include?(params["delivery"])
         @session.validate_pool_context!(params["context"])
+        @session.ensure_stack! if params["delivery"] == "stack"
         return unless snapshot
         raise ArgumentError, "This pool only permits public draws" if params["visibility"] == "private" && !snapshot["private_draws"]
         raise PoolExhausted, "Not enough pool items" if capacity && count > snapshot["remaining"]
@@ -515,6 +522,7 @@ module EltenAPI
       end
 
       def stack_state
+        ensure_stack!(allow_closed: true)
         @mutex.synchronize { @stack_state.dup }
       end
 
@@ -566,9 +574,24 @@ module EltenAPI
         Pool.new(self, id)
       end
 
+      def stack_enabled?
+        @mutex.synchronize { @limits["stack"] == true && @limits.fetch("max_stack_entries", LEGACY_STACK_ENTRIES).to_i.positive? }
+      end
+
+      def pools_enabled?
+        @mutex.synchronize { @limits["pools"] == true && @limits.fetch("max_pools", LEGACY_POOL_COUNT).to_i.positive? }
+      end
+
+      def ensure_stack!(allow_closed: false)
+        ensure_open! unless allow_closed
+        raise StackUnsupported, "Server does not support live session stacks" unless @limits["stack"] == true
+        raise StackDisabled, "Live session stack is disabled" unless stack_enabled?
+      end
+
       def ensure_pools!
         ensure_open!
         raise PoolUnsupported, "Server does not support live session pools" unless @limits["pools"] == true
+        raise PoolsDisabled, "Live session pools are disabled" unless pools_enabled?
       end
 
       def pool_message_id(value)
@@ -587,7 +610,6 @@ module EltenAPI
         ensure_pools!
         bytes = JSON.generate(packet).bytesize
         if delivery == "stack"
-          raise StackUnsupported, "Server does not support live session stacks" unless @limits["stack"] == true
           validate_stack_push!(bytes, capacity: capacity)
         elsif bytes > @limits.fetch("max_message_bytes", 16 * 1024)
           raise PoolPacketTooLarge, "Pool message exceeds the session message limit"
@@ -626,7 +648,6 @@ module EltenAPI
         packet["context"] = params["context"] unless params["context"].nil?
         bytes = JSON.generate(packet).bytesize
         if operation == :stack_random
-          raise StackUnsupported, "Server does not support live session stacks" unless @limits["stack"] == true
           validate_stack_push!(bytes, capacity: capacity)
         elsif bytes > @limits.fetch("max_message_bytes", 16 * 1024)
           raise RandomPacketTooLarge, "Random packet exceeds the session message limit"
@@ -635,6 +656,7 @@ module EltenAPI
       end
 
       def stack_read(after: 0, limit: nil, through: nil, timeout: 120, cancellation_token: nil)
+        ensure_stack!
         params = { "after" => stack_integer(after, "after") }
         params["limit"] = stack_integer(limit, "limit", minimum: 1) unless limit.nil?
         params["through"] = stack_integer(through, "through") unless through.nil?
@@ -642,19 +664,20 @@ module EltenAPI
       end
 
       def stack_trim(through:, timeout: 45, cancellation_token: nil)
-        ensure_open!
+        ensure_stack!
         raise NotOwner, "Only the live session owner can trim it" unless owner?
         @endpoint.stack_request(self, :trim, { "through" => stack_integer(through, "through") }, timeout: timeout, cancellation_token: cancellation_token)
       end
 
       def stack_clear(timeout: 120, cancellation_token: nil)
-        ensure_open!
+        ensure_stack!
         raise NotOwner, "Only the live session owner can clear it" unless owner?
         state = stack_read(limit: 1, timeout: timeout, cancellation_token: cancellation_token)
         stack_trim(through: state.fetch("through"), timeout: timeout, cancellation_token: cancellation_token)
       end
 
       def on_stack_changed(&block)
+        ensure_stack!
         register_callback(:stack_changed, &block)
         notify_stack_changed
         self
@@ -662,14 +685,17 @@ module EltenAPI
 
       def on_stack_message(with_metadata: false, &block)
         raise ArgumentError, "callback is required" unless block
-        ensure_open!
-        raise StackUnsupported, "Server does not support live session stacks" unless @limits["stack"] == true
+        ensure_stack!
         register_message_callback(:stack_message, with_metadata, &block)
       end
 
-      def on_stack_gap(&block); register_callback(:stack_gap, &block); end
+      def on_stack_gap(&block)
+        ensure_stack!
+        register_callback(:stack_gap, &block)
+      end
 
       def tick_stack_messages(now)
+        return unless stack_enabled?
         request = @mutex.synchronize { @stack_read_request }
         if request
           begin
@@ -711,11 +737,11 @@ module EltenAPI
       end
 
       def validate_stack_push!(bytes, capacity: true)
-        ensure_open!
+        ensure_stack!
         @mutex.synchronize do
           maximum = @limits.fetch("max_stack_entry_bytes", DEFAULT_STACK_ENTRY_BYTES).to_i
           raise StackPacketTooLarge, "Stack packet exceeds #{maximum} bytes" if bytes > maximum
-          if capacity && @stack_state["count"].to_i >= @limits.fetch("max_stack_entries", DEFAULT_STACK_ENTRIES).to_i
+          if capacity && @stack_state["count"].to_i >= @limits.fetch("max_stack_entries", LEGACY_STACK_ENTRIES).to_i
             raise StackFull, "Live session stack is full"
           end
         end
@@ -971,7 +997,7 @@ module EltenAPI
           @snapshot_revision = revision.to_i unless revision.nil?
           @limits = data["limits"].dup if data["limits"].is_a?(Hash)
           stack = data["stack"]
-          @limits = { "max_stack_entry_bytes" => DEFAULT_STACK_ENTRY_BYTES, "max_stack_entries" => DEFAULT_STACK_ENTRIES }.merge(@limits || {})
+          @limits = { "max_stack_entry_bytes" => DEFAULT_STACK_ENTRY_BYTES, "max_stack_entries" => LEGACY_STACK_ENTRIES }.merge(@limits || {})
           @id = (data["id"] || data["session_id"] || @id).to_s
           @metadata = data["metadata"] if data["metadata"].is_a?(Hash)
           @metadata ||= {}
@@ -1134,11 +1160,12 @@ module EltenAPI
         LiveSessions.register(self)
       end
 
-      def create(metadata: {}, participant_metadata: {}, capacity: 2, visibility: :private, join_code: nil, discovery_metadata: {}, timeout: 45, cancellation_token: nil, stack_entry_bytes: DEFAULT_STACK_ENTRY_BYTES, stack_entries: DEFAULT_STACK_ENTRIES, pool_count: 1, private_messages: false)
+      def create(metadata: {}, participant_metadata: {}, capacity: 2, visibility: :private, join_code: nil, discovery_metadata: {}, timeout: 45, cancellation_token: nil, stack_entry_bytes: DEFAULT_STACK_ENTRY_BYTES, stack_entries: DEFAULT_STACK_ENTRIES, pool_count: DEFAULT_POOL_COUNT, private_messages: false)
         ensure_open!
         raise ArgumentError, "private_messages must be boolean" unless private_messages == true || private_messages == false
-        [stack_entry_bytes, stack_entries, pool_count].each do |value|
-          raise ArgumentError, "Stack limits must be positive integers" unless value.is_a?(Integer) && value.positive?
+        raise ArgumentError, "stack_entry_bytes must be a positive integer" unless stack_entry_bytes.is_a?(Integer) && stack_entry_bytes.positive?
+        [stack_entries, pool_count].each do |value|
+          raise ArgumentError, "Stack and pool capacities must be non-negative integers" unless value.is_a?(Integer) && value >= 0
         end
         visibility = visibility.to_s
         raise ArgumentError, "Invalid session visibility" unless %w[private public].include?(visibility)
@@ -1156,9 +1183,13 @@ module EltenAPI
           session.close_local(:unsupported)
           raise PrivateMessagesUnsupported, "Server did not enable private live session messages"
         end
-        if pool_count != 1 && session.limits["pools"] != true
+        if stack_entries.positive? != session.stack_enabled?
           session.close_local(:unsupported)
-          raise PoolUnsupported, "Server does not support live session pools"
+          raise StackUnsupported, "Server did not apply the requested stack configuration"
+        end
+        if pool_count.positive? != session.pools_enabled?
+          session.close_local(:unsupported)
+          raise PoolUnsupported, "Server did not apply the requested pool configuration"
         end
         if (visibility != "private" || join_code || !discovery_metadata.empty?) && session.limits["discovery"] != true
           session.close_local(:unsupported)
@@ -1167,7 +1198,7 @@ module EltenAPI
         session
       end
 
-      def connect(user, metadata: {}, participant_metadata: {}, capacity: 2, timeout: 10, stack_entry_bytes: DEFAULT_STACK_ENTRY_BYTES, stack_entries: DEFAULT_STACK_ENTRIES, visibility: :private, join_code: nil, discovery_metadata: {}, pool_count: 1, private_messages: false)
+      def connect(user, metadata: {}, participant_metadata: {}, capacity: 2, timeout: 10, stack_entry_bytes: DEFAULT_STACK_ENTRY_BYTES, stack_entries: DEFAULT_STACK_ENTRIES, visibility: :private, join_code: nil, discovery_metadata: {}, pool_count: DEFAULT_POOL_COUNT, private_messages: false)
         session = create(metadata: metadata, participant_metadata: participant_metadata, capacity: capacity,
           stack_entry_bytes: stack_entry_bytes, stack_entries: stack_entries, visibility: visibility, join_code: join_code, discovery_metadata: discovery_metadata, pool_count: pool_count, private_messages: private_messages)
         session.invite(user)
@@ -1359,8 +1390,9 @@ module EltenAPI
 
       def queue_stack_request(session, operation, params, retries: 2, timeout: 120, check_capacity: false)
         ensure_session!(session)
-        raise StackUnsupported, "Server does not support live session stacks" unless session.limits["stack"] == true
-        queue_live_request(session, operation, params, retries: retries, timeout: timeout, check_capacity: check_capacity)
+        session.ensure_stack!
+        check = ->(_first) { session.ensure_stack! }
+        queue_live_request(session, operation, params, retries: retries, timeout: timeout, check_capacity: check_capacity, validator: check)
       end
 
       def cancel_stack_request(request)

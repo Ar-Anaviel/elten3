@@ -417,7 +417,7 @@ module EltenLink
         true
       end
 
-      def create_live_session(client, appid:, instance_id:, metadata: {}, participant_metadata: {}, capacity: 2, visibility: :private, join_code: nil, discovery_metadata: {}, stack_entry_bytes: 256, stack_entries: 1024, pool_count: 1, private_messages: false)
+      def create_live_session(client, appid:, instance_id:, metadata: {}, participant_metadata: {}, capacity: 2, visibility: :private, join_code: nil, discovery_metadata: {}, stack_entry_bytes: 256, stack_entries: 0, pool_count: 0, private_messages: false)
         client.api_data(
           "POST",
           "/api/v1/apps/live-sessions",
