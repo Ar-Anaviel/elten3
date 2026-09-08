@@ -15,12 +15,18 @@ module EltenAPI
     MAX_QUEUE_ITEMS = 4_096
     MAX_QUEUE_BYTES = 8 * 1024 * 1024
     MAX_PENDING_INVITATIONS = 128
+    DEFAULT_STACK_ENTRY_BYTES = 256
+    DEFAULT_STACK_ENTRIES = 1024
+    STACK_MESSAGE_PAGE_SIZE = 128
 
     class Error < StandardError; end
     class TimeoutError < Error; end
     class SessionClosed < Error; end
     class NotOwner < Error; end
     class QueueOverflow < Error; end
+    class StackPacketTooLarge < Error; end
+    class StackFull < Error; end
+    class StackUnsupported < Error; end
 
     Message = Struct.new(:id, :sequence, :sender, :packet, keyword_init: true)
 
@@ -155,6 +161,13 @@ module EltenAPI
         @participants = {}
         @ack = 0
         @state = :open
+        @stack_state = { "revision" => -1, "last_seq" => 0, "trimmed_through" => 0, "count" => 0, "first_seq" => nil }
+        @stack_notice = false
+        @stack_cursor = 0
+        @stack_read_request = @stack_page = @stack_delivery = @stack_through = nil
+        @stack_started = @stack_callback_pending = @stack_reader_failed = false
+        @stack_read_failures = 0
+        @stack_retry_at = 0.0
         apply_snapshot(data)
       end
 
@@ -198,6 +211,123 @@ module EltenAPI
         ensure_open!
         validate_json!(packet)
         @endpoint.send_packet(self, packet, message_id: message_id, retries: retries, cancellation_token: cancellation_token)
+      end
+
+      def stack_state
+        @mutex.synchronize { @stack_state.dup }
+      end
+
+      def stack_push(packet = MISSING_PACKET, message_id: nil, retries: 2, timeout: 45, cancellation_token: nil, **packet_fields)
+        if packet.equal?(MISSING_PACKET) && !packet_fields.empty?
+          packet = packet_fields
+        elsif packet.equal?(MISSING_PACKET) || !packet_fields.empty?
+          raise ArgumentError, "exactly one packet is required"
+        end
+        identity = message_id || SecureRandom.uuid
+        raise ArgumentError, "Invalid message_id" unless identity.is_a?(String) && identity.match?(/\A[A-Za-z0-9_-]{16,64}\z/)
+        encoded = JSON.generate(packet)
+        validate_stack_push!(encoded.bytesize, capacity: message_id.nil?)
+        @endpoint.stack_request(self, :push, { "packet" => JSON.parse(encoded), "message_id" => identity },
+          retries: retries, timeout: timeout, cancellation_token: cancellation_token, check_capacity: message_id.nil?)
+      end
+
+      def stack_read(after: 0, limit: nil, through: nil, timeout: 120, cancellation_token: nil)
+        params = { "after" => stack_integer(after, "after") }
+        params["limit"] = stack_integer(limit, "limit", minimum: 1) unless limit.nil?
+        params["through"] = stack_integer(through, "through") unless through.nil?
+        @endpoint.stack_request(self, :read, params, timeout: timeout, cancellation_token: cancellation_token)
+      end
+
+      def stack_trim(through:, timeout: 45, cancellation_token: nil)
+        ensure_open!
+        raise NotOwner, "Only the live session owner can trim it" unless owner?
+        @endpoint.stack_request(self, :trim, { "through" => stack_integer(through, "through") }, timeout: timeout, cancellation_token: cancellation_token)
+      end
+
+      def stack_clear(timeout: 120, cancellation_token: nil)
+        ensure_open!
+        raise NotOwner, "Only the live session owner can clear it" unless owner?
+        state = stack_read(limit: 1, timeout: timeout, cancellation_token: cancellation_token)
+        stack_trim(through: state.fetch("through"), timeout: timeout, cancellation_token: cancellation_token)
+      end
+
+      def on_stack_changed(&block)
+        register_callback(:stack_changed, &block)
+        notify_stack_changed
+        self
+      end
+
+      def on_stack_message(&block)
+        raise ArgumentError, "callback is required" unless block
+        ensure_open!
+        raise StackUnsupported, "Server does not support live session stacks" unless @limits["stack"] == true
+        register_callback(:stack_message, &block)
+      end
+
+      def on_stack_gap(&block); register_callback(:stack_gap, &block); end
+
+      def tick_stack_messages(now)
+        request = @mutex.synchronize { @stack_read_request }
+        if request
+          begin
+            value, error = request[:result].pop(true)
+          rescue ThreadError
+            return
+          end
+          @endpoint.cancel_stack_request(request)
+          @mutex.synchronize { @stack_read_request = nil if @stack_read_request.equal?(request) }
+          return if closed?
+          raise error if error
+          validate_stack_page!(value, request[:params])
+          @mutex.synchronize do
+            return if @state == :closed
+            @stack_page = value
+            @stack_read_failures = 0
+            @stack_retry_at = 0.0
+          end
+        end
+        queue_stack_callback
+        params = @mutex.synchronize do
+          next if @state == :closed || @callbacks[:stack_message].empty? || @stack_reader_failed
+          next if @stack_read_request || @stack_page || @stack_delivery || now < @stack_retry_at
+          next if @stack_started && @stack_through.nil? && @stack_cursor >= @stack_state["last_seq"].to_i
+          values = { "after" => @stack_cursor, "limit" => STACK_MESSAGE_PAGE_SIZE }
+          values["through"] = @stack_through unless @stack_through.nil?
+          values
+        end
+        return unless params
+        request = @endpoint.queue_stack_request(self, :read, params, retries: 0, timeout: 15)
+        accepted = @mutex.synchronize do
+          next false if @state == :closed
+          @stack_read_request = request
+          true
+        end
+        @endpoint.cancel_stack_request(request) unless accepted
+      rescue StandardError => error
+        stack_read_failed(error, now) unless closed?
+      end
+
+      def validate_stack_push!(bytes, capacity: true)
+        ensure_open!
+        @mutex.synchronize do
+          maximum = @limits.fetch("max_stack_entry_bytes", DEFAULT_STACK_ENTRY_BYTES).to_i
+          raise StackPacketTooLarge, "Stack packet exceeds #{maximum} bytes" if bytes > maximum
+          if capacity && @stack_state["count"].to_i >= @limits.fetch("max_stack_entries", DEFAULT_STACK_ENTRIES).to_i
+            raise StackFull, "Live session stack is full"
+          end
+        end
+      end
+
+      def apply_stack_state(data, limits = nil)
+        changed = @mutex.synchronize do
+          next false if @state == :closed
+          @limits = limits.dup if limits.is_a?(Hash)
+          next false unless data.is_a?(Hash) && data["revision"].to_i > @stack_state["revision"].to_i
+          @stack_state = data.dup
+          true
+        end
+        notify_stack_changed if changed
+        changed
       end
 
       def receive(timeout: nil, cancellation_token: nil)
@@ -254,7 +384,7 @@ module EltenAPI
           {
             "id" => @id,
             "participant_id" => @participant_id,
-            "ack" => @ack
+            "ack" => @ack, "stack_revision" => @stack_state["revision"].to_i
           }
         end
       end
@@ -283,13 +413,18 @@ module EltenAPI
       end
 
       def close_local(reason, confirmed: false, operation: :leave)
+        stack_request = nil
         changed = @mutex.synchronize do
           next false if @state == :closed
           @state = :closed
+          stack_request = @stack_read_request
+          @stack_read_request = @stack_page = @stack_delivery = nil
+          @stack_callback_pending = false
           @condition.broadcast
           true
         end
         if changed
+          @endpoint.cancel_stack_request(stack_request) if stack_request
           @messages.close
           @endpoint.session_closed(self, confirmed: confirmed, operation: operation)
           emit(:closed, reason.to_sym)
@@ -299,13 +434,139 @@ module EltenAPI
 
       private
 
+      def stack_integer(value, name, minimum: 0)
+        raise ArgumentError, "#{name} must be an integer >= #{minimum}" unless value.is_a?(Integer) && value >= minimum
+        value
+      end
+
+      def validate_stack_page!(page, params)
+        valid = page.is_a?(Hash) && page["session_id"] == @id && page["entries"].is_a?(Array) &&
+          page["entries"].length <= STACK_MESSAGE_PAGE_SIZE && page["cursor"].is_a?(Integer) &&
+          page["through"].is_a?(Integer) && page["through"] >= params["after"] &&
+          (!params.key?("through") || page["through"] == params["through"])
+        cursor = params["after"]
+        if valid && page["gap"]
+          gap = page["gap"]
+          valid = gap.is_a?(Hash) && gap["from"] == cursor + 1 && gap["to"].is_a?(Integer) &&
+            gap["to"] >= gap["from"] && gap["to"] <= page["through"]
+          cursor = gap["to"] if valid
+        end
+        if valid
+          page["entries"].each do |entry|
+            unless entry.is_a?(Hash) && entry["seq"].is_a?(Integer) && entry["seq"] == cursor + 1 && entry.key?("packet")
+              valid = false
+              break
+            end
+            cursor = entry["seq"]
+          end
+          valid &&= page["cursor"] == cursor && cursor <= page["through"] &&
+            page["has_more"] == (cursor < page["through"]) &&
+            (cursor > params["after"] || page["has_more"] == false)
+        end
+        raise EltenLink::Error.new("Invalid live session stack page", code: "invalid_json") unless valid
+      end
+
+      def stack_read_failed(error, now)
+        retryable = @endpoint.stack_request_retryable?(error)
+        @mutex.synchronize do
+          return if @state == :closed
+          @stack_read_failures += 1
+          advertised = error.respond_to?(:retry_after) ? error.retry_after.to_f : 0
+          @stack_retry_at = now + [advertised, [2**[@stack_read_failures - 1, 5].min, 30].min].max
+          @stack_reader_failed = !retryable
+        end
+        @endpoint.record_error(error)
+        if error.is_a?(EltenLink::Error) && %w[apps.live_sessions.closed apps.live_sessions.not_found apps.live_sessions.membership_required].include?(error.code)
+          close_local(:expired, confirmed: error.code != "apps.live_sessions.closed")
+        end
+      end
+
+      def queue_stack_callback
+        queued = @mutex.synchronize do
+          next false if @state == :closed || @stack_callback_pending || !@stack_page
+          unless @stack_delivery
+            gap = @stack_page.delete("gap")
+            if gap
+              @stack_delivery = { sequence: gap["to"], callbacks: @callbacks[:stack_gap].dup, arguments: [gap], index: 0 }
+              if @stack_delivery[:callbacks].empty?
+                @stack_cursor = gap["to"]
+                @stack_delivery = nil
+              end
+            end
+            unless @stack_delivery
+              entry = @stack_page["entries"].shift
+              if entry
+                sender_data = entry["sender"].is_a?(Hash) ? entry["sender"] : {}
+                sender = @participants[entry["sender_id"].to_s] || Participant.new(sender_data)
+                @stack_delivery = { sequence: entry["seq"], callbacks: @callbacks[:stack_message].dup,
+                  arguments: [sender, entry["packet"]], index: 0 }
+              else
+                @stack_cursor = @stack_page["cursor"]
+                @stack_through = @stack_page["has_more"] ? @stack_page["through"] : nil
+                @stack_started = true
+                @stack_page = nil
+                next false
+              end
+            end
+          end
+          @stack_callback_pending = true
+        end
+        return unless queued
+        accepted = @endpoint.enqueue_callback(-> { dispatch_stack_callback })
+        @mutex.synchronize { @stack_callback_pending = false } unless accepted
+      end
+
+      def dispatch_stack_callback
+        delivery = @mutex.synchronize { @stack_delivery unless @state == :closed }
+        return unless delivery
+        begin
+          delivery[:callbacks][delivery[:index]].call(*delivery[:arguments])
+        ensure
+          @mutex.synchronize do
+            if @stack_delivery.equal?(delivery)
+              delivery[:index] += 1
+              if delivery[:index] >= delivery[:callbacks].length
+                @stack_cursor = delivery[:sequence]
+                @stack_delivery = nil
+              end
+            end
+            @stack_callback_pending = false
+          end
+          queue_stack_callback
+        end
+      end
+
+      def notify_stack_changed
+        enqueue = @mutex.synchronize do
+          next false if @state == :closed || @stack_notice || @callbacks[:stack_changed].empty?
+          @stack_notice = true
+        end
+        return unless enqueue
+        accepted = @endpoint.enqueue_callback(lambda do
+          callbacks, snapshot = @mutex.synchronize do
+            @stack_notice = false
+            [@callbacks[:stack_changed].dup, @stack_state.dup]
+          end
+          callbacks.each do |callback|
+            begin
+              callback.call(snapshot.dup)
+            rescue Exception => error
+              Log.warning("Live session stack callback failed: #{error.class}: #{error.message}") if defined?(Log)
+            end
+          end
+        end)
+        @mutex.synchronize { @stack_notice = false } unless accepted
+      end
+
       def apply_snapshot(data)
+        stack = nil
         @mutex.synchronize do
           revision = data["revision"]
           return if !revision.nil? && revision.to_i < @snapshot_revision
           @snapshot_revision = revision.to_i unless revision.nil?
-          @limits = data["limits"] if data["limits"].is_a?(Hash)
-          @limits ||= {}
+          @limits = data["limits"].dup if data["limits"].is_a?(Hash)
+          stack = data["stack"]
+          @limits = { "max_stack_entry_bytes" => DEFAULT_STACK_ENTRY_BYTES, "max_stack_entries" => DEFAULT_STACK_ENTRIES }.merge(@limits || {})
           @id = (data["id"] || data["session_id"] || @id).to_s
           @metadata = data["metadata"] if data["metadata"].is_a?(Hash)
           @metadata ||= {}
@@ -324,6 +585,7 @@ module EltenAPI
             @condition.broadcast
           end
         end
+        apply_stack_state(stack) if stack
       end
 
       def apply_event(event)
@@ -422,6 +684,9 @@ module EltenAPI
         @callback_queue = SizedQueue.new(MAX_QUEUE_ITEMS)
         @invitation_queue = EventQueue.new
         @control_responses = Queue.new
+        @stack_requests = []
+        @stack_pending = nil
+        @stack_responses = Queue.new
         @control_pending = nil
         @control_serial = 0
         @control_failures = 0
@@ -436,21 +701,24 @@ module EltenAPI
         LiveSessions.register(self)
       end
 
-      def create(metadata: {}, participant_metadata: {}, capacity: 2)
+      def create(metadata: {}, participant_metadata: {}, capacity: 2, stack_entry_bytes: DEFAULT_STACK_ENTRY_BYTES, stack_entries: DEFAULT_STACK_ENTRIES)
         ensure_open!
+        [stack_entry_bytes, stack_entries].each do |value|
+          raise ArgumentError, "Stack limits must be positive integers" unless value.is_a?(Integer) && value.positive?
+        end
         data = EltenLink::Apps.create_live_session(
           @client,
           appid: @app_id,
           instance_id: @instance_id,
           metadata: metadata,
           participant_metadata: participant_metadata,
-          capacity: capacity
+          capacity: capacity, stack_entry_bytes: stack_entry_bytes, stack_entries: stack_entries
         )
         store_session(data)
       end
 
-      def connect(user, metadata: {}, participant_metadata: {}, capacity: 2, timeout: 10)
-        session = create(metadata: metadata, participant_metadata: participant_metadata, capacity: capacity)
+      def connect(user, metadata: {}, participant_metadata: {}, capacity: 2, timeout: 10, stack_entry_bytes: DEFAULT_STACK_ENTRY_BYTES, stack_entries: DEFAULT_STACK_ENTRIES)
+        session = create(metadata: metadata, participant_metadata: participant_metadata, capacity: capacity, stack_entry_bytes: stack_entry_bytes, stack_entries: stack_entries)
         session.invite(user)
         session.wait_for_participant(user, timeout: timeout)
         session
@@ -582,6 +850,50 @@ module EltenAPI
         )
       end
 
+      def stack_request(session, operation, params, retries: 2, timeout: 120, cancellation_token: nil, check_capacity: false)
+        request = queue_stack_request(session, operation, params, retries: retries, timeout: timeout, check_capacity: check_capacity)
+        loop do
+          cancellation_token&.raise_if_cancelled!
+          begin
+            value, error = request[:result].pop(true)
+            raise error if error
+            return value
+          rescue ThreadError
+            raise TimeoutError, "Live session stack request timed out" if monotonic >= request[:deadline]
+            wait_step(cancellation_token: cancellation_token)
+          end
+        end
+      ensure
+        cancel_stack_request(request) if request
+      end
+
+      def queue_stack_request(session, operation, params, retries: 2, timeout: 120, check_capacity: false)
+        ensure_session!(session)
+        raise StackUnsupported, "Server does not support live session stacks" unless session.limits["stack"] == true
+        timeout = Float(timeout)
+        raise ArgumentError, "timeout must be positive and finite" unless timeout.finite? && timeout.positive?
+        token = EltenAPI::Tasks::CancellationToken.new if defined?(EltenAPI::Tasks::CancellationToken)
+        request = { session: session, operation: operation, params: params, attempts: 0, retries: [[retries.to_i, 0].max, 2].min,
+          deadline: monotonic + timeout, next_at: monotonic, result: Queue.new, cancellation: token, check_capacity: check_capacity }
+        @mutex.synchronize do
+          raise QueueOverflow, "Too many pending stack requests" if @stack_requests.length >= MAX_QUEUE_ITEMS
+          @stack_requests << request
+        end
+        request
+      end
+
+      def cancel_stack_request(request)
+        request[:abandoned] = true
+        request[:raw]&.close
+        request[:cancellation]&.cancel
+        @mutex.synchronize { @stack_requests.delete(request) }
+      end
+
+      def stack_request_retryable?(error)
+        return true if error.is_a?(TimeoutError) || error.is_a?(QueueOverflow)
+        error.is_a?(EltenLink::Error) && (%w[network_error timeout invalid_json rate_limits.exceeded rate_limits.unavailable apps.live_sessions.rate_limited apps.live_sessions.busy apps.live_sessions.unavailable].include?(error.code) || [500, 502, 503, 504].include?(error.status.to_i))
+      end
+
       def session_closed(session, confirmed: false, operation: :leave)
         @mutex.synchronize do
           @sessions.delete(session.id)
@@ -619,7 +931,7 @@ module EltenAPI
             callback_bytes: @callback_bytes,
             pending_envelope_bytes: @pending_envelope_bytes,
             control_pending: !@control_pending.nil?,
-            pending_departures: @departures.length,
+            pending_departures: @departures.length, stack_requests: @stack_requests.length, stack_pending: !@stack_pending.nil?,
             unresponsive_sessions: @lease_deadlines.select { |_id, deadline| monotonic >= deadline }.keys,
             control_failures: @control_failures,
             last_error_code: @last_error.respond_to?(:code) ? @last_error.code : @last_error&.class&.name
@@ -678,6 +990,8 @@ module EltenAPI
         return false unless @protocol_mutex.try_lock
         begin
           drain_control_responses
+          tick_stack_requests
+          sessions.each { |session| session.tick_stack_messages(monotonic) }
           expire_invitations
           now = monotonic
           drain_departure_responses
@@ -700,7 +1014,7 @@ module EltenAPI
           start_control(now) if now >= @next_control_at.to_f && now >= @retry_not_before
           start_departure(now)
           finished = @mutex.synchronize { @closed && @departures.empty? }
-          LiveSessions.unregister(self) if finished && @departure_pending.nil?
+          LiveSessions.unregister(self) if finished && @departure_pending.nil? && @stack_pending.nil?
           true
         ensure
           @protocol_mutex.unlock
@@ -864,6 +1178,8 @@ module EltenAPI
               if status["accepted"] == true
                 seconds = status["lease_until"] ? status["lease_until"].to_f - data["time"].to_f : lease
                 renew_local_lease(status["id"].to_s, seconds: seconds, started_at: started_at)
+                session = @mutex.synchronize { @sessions[status["id"].to_s] }
+                session&.apply_stack_state(status["stack"], status["limits"])
                 next
               end
               if status["retryable"] == true
@@ -884,6 +1200,107 @@ module EltenAPI
         end
       rescue ThreadError
         nil
+      end
+
+      def tick_stack_requests
+        loop do
+          request, attempt, value, error = @stack_responses.pop(true)
+          next unless @stack_pending.equal?(request) && request[:attempts] == attempt
+          @stack_pending = nil
+          request[:raw].close
+          next if request[:abandoned]
+          if error
+            retryable = stack_request_retryable?(error)
+            delay = [error.respond_to?(:retry_after) ? error.retry_after.to_f : 0, 2**[attempt - 1, 2].min].max
+            if retryable && attempt <= request[:retries] && monotonic + delay < request[:deadline] && !request[:session].closed?
+              request[:next_at] = monotonic + delay
+              @mutex.synchronize { @stack_requests << request }
+            else
+              request[:result] << [nil, error]
+            end
+          else
+            request[:session].apply_stack_state(value["stack"])
+            renew_local_lease(request[:session].id)
+            request[:result] << [value, nil]
+          end
+        end
+      rescue ThreadError
+        now = monotonic
+        if @stack_pending && (@stack_pending[:abandoned] || @stack_pending[:session].closed? || now >= @stack_pending[:deadline])
+          request = @stack_pending
+          @stack_pending = nil
+          request[:abandoned] = true
+          request[:raw].close
+          request[:cancellation]&.cancel
+          error = request[:session].closed? ? SessionClosed.new("Live session is closed") : TimeoutError.new("Live session stack request timed out")
+          request[:result] << [nil, error]
+        end
+        if @stack_pending && now >= @stack_pending[:attempt_deadline] && !@stack_pending[:timed_out]
+          request = @stack_pending
+          request[:timed_out] = true
+          request[:raw].close
+          request[:cancellation]&.cancel
+          @stack_responses << [request, request[:attempts], nil, EltenLink::Error.timeout]
+        end
+        @mutex.synchronize do
+          @stack_requests.delete_if do |request|
+            invalid = request[:abandoned] || request[:session].closed? || now >= request[:deadline]
+            request[:result] << [nil, request[:session].closed? ? SessionClosed.new("Live session is closed") : TimeoutError.new("Live session stack request timed out")] if invalid && !request[:abandoned]
+            invalid
+          end
+        end
+        start_stack_request(now) unless @stack_pending
+      end
+
+      def start_stack_request(now)
+        request = @mutex.synchronize do
+          index = @stack_requests.index { |entry| entry[:next_at] <= now }
+          index && @stack_requests.delete_at(index)
+        end
+        return unless request
+        if request[:operation] == :push
+          request[:session].validate_stack_push!(JSON.generate(request[:params]["packet"]).bytesize, capacity: request[:check_capacity] && request[:attempts].zero?)
+        end
+        @stack_pending = request
+        request[:timed_out] = false
+        request[:attempt_deadline] = request[:operation] == :read ? request[:deadline] : [now + 15, request[:deadline]].min
+        request[:cancellation] = EltenAPI::Tasks::CancellationToken.new if defined?(EltenAPI::Tasks::CancellationToken)
+        request[:attempts] += 1
+        attempt = request[:attempts]
+        raw = request[:raw] = Queue.new
+        cancellation = request[:cancellation]
+        method, path, params = EltenLink::Apps.live_session_stack_request(request[:session].id, request[:session].participant_id, request[:operation], request[:params])
+        auth = { "name" => @user, "token" => @token }
+        if method == "GET" || method == "DELETE"
+          path = EltenLink::Client.append_query(path, params.merge(auth))
+          params = {}
+        else
+          path = EltenLink::Client.append_query(path, auth)
+        end
+        Thread.new do
+          begin
+            @client.e_json_request(method, path, params, cancellation_token: cancellation) do |answer, _data|
+              raw << answer unless raw.closed?
+            rescue ClosedQueueError
+              nil
+            end
+            answer = raw.pop
+            next if request[:abandoned] || answer.nil?
+            payload = answer.is_a?(String) ? JSON.parse(answer) : nil
+            unless payload.is_a?(Hash) && payload["success"] == true && payload["data"].is_a?(Hash)
+              raise EltenLink::Error.new(payload.is_a?(Hash) ? payload.dig("error", "message") : "Live session stack request failed",
+                code: payload.is_a?(Hash) ? payload.dig("error", "code") : "network_error", response: payload)
+            end
+            @stack_responses << [request, attempt, payload["data"], nil] unless request[:abandoned]
+          rescue JSON::ParserError => error
+            @stack_responses << [request, attempt, nil, EltenLink::Error.new(error.message, code: "invalid_json")] unless request[:abandoned]
+          rescue Exception => error
+            @stack_responses << [request, attempt, nil, error] unless request[:abandoned]
+          end
+        end
+      rescue StandardError => error
+        @stack_pending = nil
+        request[:result] << [nil, error] if request
       end
 
       def start_departure(now)

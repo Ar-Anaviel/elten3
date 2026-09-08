@@ -417,7 +417,7 @@ module EltenLink
         true
       end
 
-      def create_live_session(client, appid:, instance_id:, metadata: {}, participant_metadata: {}, capacity: 2)
+      def create_live_session(client, appid:, instance_id:, metadata: {}, participant_metadata: {}, capacity: 2, stack_entry_bytes: 256, stack_entries: 1024)
         client.api_data(
           "POST",
           "/api/v1/apps/live-sessions",
@@ -426,7 +426,9 @@ module EltenLink
             "instance_id" => instance_id,
             "metadata" => metadata,
             "participant_metadata" => participant_metadata,
-            "capacity" => capacity
+            "capacity" => capacity,
+            "stack_entry_bytes" => stack_entry_bytes,
+            "stack_entries" => stack_entries
           }
         )
       end
@@ -467,6 +469,11 @@ module EltenLink
           },
           timeout: timeout, cancellation_token: cancellation_token
         )
+      end
+
+      def live_session_stack_request(session_id, participant_id, operation, params = {})
+        method = { push: "POST", read: "GET", trim: "DELETE" }.fetch(operation)
+        [method, "#{live_session_path(session_id)}/stack", params.merge("participant_id" => participant_id)]
       end
 
       def leave_live_session(client, session_id:, participant_id:, timeout: Client::DEFAULT_TIMEOUT)
