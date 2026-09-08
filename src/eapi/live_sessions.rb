@@ -207,16 +207,26 @@ module EltenAPI
 
       def leave
         return false if closed?
-        @endpoint.leave_session(self)
-        close_local(:left)
+        confirmed = false
+        begin
+          @endpoint.leave_session(self)
+          confirmed = true
+        ensure
+          close_local(:left, confirmed: confirmed)
+        end
         true
       end
 
       def close
         ensure_open!
         raise NotOwner, "Only the live session owner can close it" unless owner?
-        @endpoint.close_session(self)
-        close_local(:closed)
+        confirmed = false
+        begin
+          @endpoint.close_session(self)
+          confirmed = true
+        ensure
+          close_local(:closed, confirmed: confirmed, operation: :close)
+        end
         true
       end
 
@@ -272,7 +282,7 @@ module EltenAPI
         false
       end
 
-      def close_local(reason)
+      def close_local(reason, confirmed: false, operation: :leave)
         changed = @mutex.synchronize do
           next false if @state == :closed
           @state = :closed
@@ -281,7 +291,7 @@ module EltenAPI
         end
         if changed
           @messages.close
-          @endpoint.session_closed(self)
+          @endpoint.session_closed(self, confirmed: confirmed, operation: operation)
           emit(:closed, reason.to_sym)
         end
         changed
@@ -399,6 +409,10 @@ module EltenAPI
         @mutex = Mutex.new
         @sessions = {}
         @lease_deadlines = {}
+        @departures = {}
+        @departure_pending = nil
+        @departure_responses = Queue.new
+        @departure_serial = 0
         @invitations = {}
         @resolved_invitations = {}
         @pending_envelopes = Hash.new { |hash, key| hash[key] = [] }
@@ -469,20 +483,17 @@ module EltenAPI
         end
         cancel_control
         @invitation_queue.close
-        current.each do |session|
-          begin
-            EltenLink::Apps.leave_live_session(
-              @client,
-              session_id: session.id,
-              participant_id: session.participant_id
-            )
-          rescue Exception
-            nil
-          ensure
-            session.close_local(:endpoint_closed)
-          end
+        current.each { |session| session.close_local(:endpoint_closed) }
+        @invitation_queue.clear
+        @mutex.synchronize do
+          @callbacks.clear
+          @callback_queue.clear
+          @callback_bytes = 0
+          @invitations.clear
+          @resolved_invitations.clear
+          @pending_envelopes.clear
+          @pending_envelope_bytes = 0
         end
-        LiveSessions.unregister(self)
         true
       end
 
@@ -537,7 +548,7 @@ module EltenAPI
         rescue EltenLink::Error => error
           @last_error = error
           if %w[apps.live_sessions.closed apps.live_sessions.not_found apps.live_sessions.membership_required].include?(error.code)
-            session.close_local(:expired)
+            session.close_local(:expired, confirmed: error.code != "apps.live_sessions.closed")
           end
           retryable = %w[network_error timeout invalid_json rate_limits.exceeded rate_limits.unavailable apps.live_sessions.rate_limited apps.live_sessions.busy apps.live_sessions.unavailable].include?(error.code) || [500, 502, 503, 504].include?(error.status.to_i)
           delay = [error.retry_after.to_f, [2**(attempts - 1), 5].min].max
@@ -556,7 +567,8 @@ module EltenAPI
         EltenLink::Apps.leave_live_session(
           @client,
           session_id: session.id,
-          participant_id: session.participant_id
+          participant_id: session.participant_id,
+          timeout: CONTROL_TIMEOUT
         )
       end
 
@@ -565,14 +577,18 @@ module EltenAPI
         EltenLink::Apps.close_live_session(
           @client,
           session_id: session.id,
-          participant_id: session.participant_id
+          participant_id: session.participant_id,
+          timeout: CONTROL_TIMEOUT
         )
       end
 
-      def session_closed(session)
+      def session_closed(session, confirmed: false, operation: :leave)
         @mutex.synchronize do
           @sessions.delete(session.id)
           @lease_deadlines.delete(session.id)
+          unless confirmed
+            @departures[session.id] ||= { id: session.id, participant_id: session.participant_id, operation: operation, attempts: 0, next_at: monotonic }
+          end
           removed = @pending_envelopes.delete(session.id) || []
           @pending_envelope_bytes -= removed.sum { |item| item[1] }
         end
@@ -603,6 +619,8 @@ module EltenAPI
             callback_bytes: @callback_bytes,
             pending_envelope_bytes: @pending_envelope_bytes,
             control_pending: !@control_pending.nil?,
+            pending_departures: @departures.length,
+            unresponsive_sessions: @lease_deadlines.select { |_id, deadline| monotonic >= deadline }.keys,
             control_failures: @control_failures,
             last_error_code: @last_error.respond_to?(:code) ? @last_error.code : @last_error&.class&.name
           }
@@ -622,6 +640,7 @@ module EltenAPI
       def enqueue_callback(callback, *arguments)
         bytes = JSON.generate(arguments).bytesize + 64
         @mutex.synchronize do
+          return false if @closed
           if @callback_bytes + bytes > MAX_QUEUE_BYTES
             @overflow = true
             return false
@@ -656,15 +675,17 @@ module EltenAPI
 
       # Bounded work, invoked by LiveSessions.tick from loop_update before callbacks.
       def protocol_tick
-        return false if closed? || !@protocol_mutex.try_lock
+        return false unless @protocol_mutex.try_lock
         begin
           drain_control_responses
           expire_invitations
           now = monotonic
-          expired = @mutex.synchronize { @lease_deadlines.select { |_id, deadline| now >= deadline }.keys }
-          expired.each do |id|
-            session = @mutex.synchronize { @sessions[id] }
-            session&.close_local(:timeout)
+          drain_departure_responses
+          if @departure_pending && now >= @departure_pending[:deadline]
+            pending = @departure_pending
+            @departure_pending = nil
+            pending[:cancellation]&.cancel
+            retry_departure(pending[:departure], TimeoutError.new("Live session departure timed out"))
           end
           if @control_pending && now >= @control_pending[:deadline]
             cancel_control
@@ -677,6 +698,9 @@ module EltenAPI
             sessions.each { |session| session.close_local(:queue_overflow) }
           end
           start_control(now) if now >= @next_control_at.to_f && now >= @retry_not_before
+          start_departure(now)
+          finished = @mutex.synchronize { @closed && @departures.empty? }
+          LiveSessions.unregister(self) if finished && @departure_pending.nil?
           true
         ensure
           @protocol_mutex.unlock
@@ -684,7 +708,7 @@ module EltenAPI
       end
 
       def dispatch_events(limit = 100)
-        return 0 if @dispatching
+        return 0 if closed? || @dispatching
         @dispatching = true
         count = 0
         started = monotonic
@@ -847,7 +871,7 @@ module EltenAPI
                 next
               end
               session = @mutex.synchronize { @sessions[status["id"].to_s] }
-              session&.close_local((status["reason"] || "expired").to_sym)
+              session&.close_local((status["reason"] || "expired").to_sym, confirmed: true)
             end
             Array(data["envelopes"]).each { |envelope| enqueue_envelope(envelope) }
             request_control if data["has_more"] == true
@@ -860,6 +884,63 @@ module EltenAPI
         end
       rescue ThreadError
         nil
+      end
+
+      def start_departure(now)
+        return if @departure_pending
+        departure = @mutex.synchronize { @departures.values.find { |entry| entry[:next_at] <= now } }
+        return unless departure
+        @departure_serial += 1
+        serial = @departure_serial
+        departure[:attempts] += 1
+        cancellation = EltenAPI::Tasks::CancellationToken.new if defined?(EltenAPI::Tasks::CancellationToken)
+        @departure_pending = { serial: serial, departure: departure, deadline: now + CONTROL_TIMEOUT, cancellation: cancellation }
+        path = EltenLink::Client.append_query(
+          "#{EltenLink::Apps.live_session_path(departure[:id])}/#{departure[:operation]}",
+          { "name" => @user, "token" => @token }
+        )
+        @client.e_json_request("POST", path, { "participant_id" => departure[:participant_id] }, cancellation_token: cancellation) do |answer, _data|
+          @departure_responses << [serial, answer]
+        end
+      rescue StandardError => error
+        @departure_pending = nil
+        cancellation&.cancel
+        retry_departure(departure, error) if departure
+      end
+
+      def drain_departure_responses
+        loop do
+          serial, answer = @departure_responses.pop(true)
+          next unless @departure_pending && @departure_pending[:serial] == serial
+          departure = @departure_pending[:departure]
+          @departure_pending = nil
+          begin
+            payload = answer.is_a?(String) ? JSON.parse(answer) : nil
+            code = payload.is_a?(Hash) ? payload.dig("error", "code").to_s : "network_error"
+            if payload.is_a?(Hash) && (payload["success"] == true || %w[apps.live_sessions.not_found apps.live_sessions.membership_required auth.unauthorized].include?(code))
+              @mutex.synchronize { @departures.delete(departure[:id]) }
+            elsif code == "apps.live_sessions.owner_required" || code == "apps.live_sessions.closed"
+              departure[:operation] = :leave
+              departure[:next_at] = monotonic
+            else
+              error = EltenLink::Error.new(
+                payload.is_a?(Hash) ? payload.dig("error", "message") : "Live session departure failed",
+                code: code, response: payload
+              )
+              retry_departure(departure, error)
+            end
+          rescue JSON::ParserError, TypeError => error
+            retry_departure(departure, error)
+          end
+        end
+      rescue ThreadError
+        nil
+      end
+
+      def retry_departure(departure, error)
+        advertised = error.respond_to?(:retry_after) ? error.retry_after.to_f : 0
+        departure[:next_at] = monotonic + [[2**[departure[:attempts] - 1, 5].min, 30].min, advertised].max
+        record_error(error)
       end
 
       def renew_local_lease(id, seconds: nil, started_at: nil)

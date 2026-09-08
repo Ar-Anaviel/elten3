@@ -469,13 +469,13 @@ module EltenLink
         )
       end
 
-      def leave_live_session(client, session_id:, participant_id:)
-        client.api_data("POST", "#{live_session_path(session_id)}/leave", { "participant_id" => participant_id })
+      def leave_live_session(client, session_id:, participant_id:, timeout: Client::DEFAULT_TIMEOUT)
+        client.api_data("POST", "#{live_session_path(session_id)}/leave", { "participant_id" => participant_id }, timeout: timeout)
         true
       end
 
-      def close_live_session(client, session_id:, participant_id:)
-        client.api_data("POST", "#{live_session_path(session_id)}/close", { "participant_id" => participant_id })
+      def close_live_session(client, session_id:, participant_id:, timeout: Client::DEFAULT_TIMEOUT)
+        client.api_data("POST", "#{live_session_path(session_id)}/close", { "participant_id" => participant_id }, timeout: timeout)
         true
       end
 
