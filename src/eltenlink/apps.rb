@@ -488,6 +488,11 @@ module EltenLink
         end
       end
 
+      def live_session_random_request(session_id, participant_id, operation, params = {})
+        suffix = { random: "random", stack_random: "stack/random" }.fetch(operation)
+        ["POST", "#{live_session_path(session_id)}/#{suffix}", params.merge("participant_id" => participant_id)]
+      end
+
       def live_session_stack_request(session_id, participant_id, operation, params = {})
         method = { push: "POST", read: "GET", trim: "DELETE" }.fetch(operation)
         [method, "#{live_session_path(session_id)}/stack", params.merge("participant_id" => participant_id)]

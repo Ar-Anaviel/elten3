@@ -28,8 +28,40 @@ module EltenAPI
     class StackFull < Error; end
     class StackUnsupported < Error; end
     class DiscoveryUnsupported < Error; end
+    class RandomUnsupported < Error; end
+    class RandomPacketTooLarge < Error; end
 
-    Message = Struct.new(:id, :sequence, :sender, :packet, keyword_init: true)
+    Message = Struct.new(:id, :sequence, :sender, :packet, keyword_init: true) do
+      attr_accessor :metadata
+    end
+
+    class MessageMetadata
+      attr_reader :id, :sequence, :origin, :created_at, :min, :max, :count, :draw_number
+
+      def initialize(envelope)
+        @id = envelope["message_id"].to_s.dup.freeze
+        @sequence = envelope["seq"].to_i
+        @created_at = envelope["created_at"]
+        @origin = :participant
+        if envelope["origin"] == "server"
+          random = envelope["random"]
+          values = envelope["packet"].is_a?(Hash) && envelope["packet"]["values"]
+          valid = random.is_a?(Hash) && random.values_at("min", "max", "count").all? { |value| value.is_a?(Integer) }
+          valid &&= random["min"] <= random["max"] && random["count"].positive? &&
+            values.is_a?(Array) && values.length == random["count"] &&
+            values.all? { |value| value.is_a?(Integer) && value.between?(random["min"], random["max"]) }
+          raise EltenLink::Error.new("Invalid server random message", code: "invalid_json") unless valid
+          @origin = :server
+          @min, @max, @count = random.values_at("min", "max", "count")
+          @draw_number = random["draw_number"]
+        end
+        freeze
+      end
+
+      def server_random?
+        @origin == :server
+      end
+    end
 
     class EventQueue
       def initialize(limit: MAX_QUEUE_ITEMS, max_bytes: MAX_QUEUE_BYTES)
@@ -314,6 +346,40 @@ module EltenAPI
           retries: retries, timeout: timeout, cancellation_token: cancellation_token, check_capacity: message_id.nil?)
       end
 
+      def send_random(min:, max:, count: 1, context: nil, message_id: nil, draw_number: nil, retries: 2, timeout: 45, cancellation_token: nil)
+        request_random(:random, min, max, count, context, message_id, draw_number, retries, timeout, cancellation_token)
+      end
+
+      def stack_push_random(min:, max:, count: 1, context: nil, message_id: nil, draw_number: nil, retries: 2, timeout: 45, cancellation_token: nil)
+        request_random(:stack_random, min, max, count, context, message_id, draw_number, retries, timeout, cancellation_token)
+      end
+
+      def validate_random_request!(operation, params, capacity: true)
+        ensure_open!
+        raise RandomUnsupported, "Server does not support live session random messages" unless @limits["random"] == true
+        maximum_count = @limits.fetch("max_random_count", 100)
+        lower = @limits.fetch("min_random_value", -9_007_199_254_740_991)
+        upper = @limits.fetch("max_random_value", 9_007_199_254_740_991)
+        min, max, count = params.values_at("min", "max", "count")
+        unless min.is_a?(Integer) && max.is_a?(Integer) && min.between?(lower, upper) && max.between?(min, upper)
+          raise ArgumentError, "Invalid random range"
+        end
+        raise ArgumentError, "count must be between 1 and #{maximum_count}" unless count.is_a?(Integer) && count.between?(1, maximum_count)
+        number = params["draw_number"]
+        raise ArgumentError, "Invalid draw_number" unless number.nil? || (number.is_a?(Integer) && number.between?(1, 9_007_199_254_740_991))
+        widest = [min, max].max_by { |value| value.to_s.bytesize }
+        packet = { "values" => Array.new(count, widest) }
+        packet["context"] = params["context"] unless params["context"].nil?
+        bytes = JSON.generate(packet).bytesize
+        if operation == :stack_random
+          raise StackUnsupported, "Server does not support live session stacks" unless @limits["stack"] == true
+          validate_stack_push!(bytes, capacity: capacity)
+        elsif bytes > @limits.fetch("max_message_bytes", 16 * 1024)
+          raise RandomPacketTooLarge, "Random packet exceeds the session message limit"
+        end
+        true
+      end
+
       def stack_read(after: 0, limit: nil, through: nil, timeout: 120, cancellation_token: nil)
         params = { "after" => stack_integer(after, "after") }
         params["limit"] = stack_integer(limit, "limit", minimum: 1) unless limit.nil?
@@ -340,11 +406,11 @@ module EltenAPI
         self
       end
 
-      def on_stack_message(&block)
+      def on_stack_message(with_metadata: false, &block)
         raise ArgumentError, "callback is required" unless block
         ensure_open!
         raise StackUnsupported, "Server does not support live session stacks" unless @limits["stack"] == true
-        register_callback(:stack_message, &block)
+        register_message_callback(:stack_message, with_metadata, &block)
       end
 
       def on_stack_gap(&block); register_callback(:stack_gap, &block); end
@@ -443,7 +509,7 @@ module EltenAPI
         true
       end
 
-      def on_message(&block); register_callback(:message, &block); end
+      def on_message(with_metadata: false, &block); register_message_callback(:message, with_metadata, &block); end
       def on_participant_joined(&block); register_callback(:participant_joined, &block); end
       def on_participant_left(&block); register_callback(:participant_left, &block); end
       def on_gap(&block); register_callback(:gap, &block); end
@@ -581,8 +647,10 @@ module EltenAPI
               if entry
                 sender_data = entry["sender"].is_a?(Hash) ? entry["sender"] : {}
                 sender = @participants[entry["sender_id"].to_s] || Participant.new(sender_data)
+                info = MessageMetadata.new(entry)
+                packet = info.server_random? ? LiveSessions.immutable_copy(entry["packet"]) : entry["packet"]
                 @stack_delivery = { sequence: entry["seq"], callbacks: @callbacks[:stack_message].dup,
-                  arguments: [sender, entry["packet"]], index: 0 }
+                  arguments: [sender, packet, info], index: 0 }
               else
                 @stack_cursor = @stack_page["cursor"]
                 @stack_through = @stack_page["has_more"] ? @stack_page["through"] : nil
@@ -682,15 +750,18 @@ module EltenAPI
         when "message"
           sender_data = event["sender"].is_a?(Hash) ? event["sender"] : {}
           sender = participant(event["sender_id"]) || Participant.new(sender_data)
+          info = MessageMetadata.new(event)
+          packet = info.server_random? ? LiveSessions.immutable_copy(event["packet"]) : event["packet"]
           message = Message.new(
             id: event["message_id"].to_s,
             sequence: event["seq"].to_i,
             sender: sender,
-            packet: event["packet"]
+            packet: packet
           )
+          message.metadata = info
           pull = @mutex.synchronize { @receive_requested || @callbacks[:message].empty? }
           @messages.push(message, bytes: JSON.generate(message.packet).bytesize + 256) if pull
-          emit(:message, sender, message.packet)
+          emit(:message, sender, message.packet, info)
         when "participant_joined"
           row = event["participant"]
           if row.is_a?(Hash)
@@ -712,6 +783,24 @@ module EltenAPI
           emit(:gap, event["from"].to_i, event["to"].to_i)
         when "closed"
           close_local(event["reason"].to_s.empty? ? :closed : event["reason"])
+        end
+      end
+
+      def request_random(operation, min, max, count, context, message_id, draw_number, retries, timeout, cancellation_token)
+        identity = message_id || SecureRandom.uuid
+        raise ArgumentError, "Invalid message_id" unless identity.is_a?(String) && identity.match?(/\A[A-Za-z0-9_-]{16,64}\z/)
+        params = { "min" => min, "max" => max, "count" => count, "context" => context, "message_id" => identity, "draw_number" => draw_number }
+        validate_random_request!(operation, params, capacity: message_id.nil?)
+        params = JSON.parse(JSON.generate(params))
+        @endpoint.random_request(self, operation, params, retries: retries, timeout: timeout,
+          cancellation_token: cancellation_token, check_capacity: message_id.nil?)
+      end
+
+      def register_message_callback(kind, with_metadata, &block)
+        raise ArgumentError, "callback is required" unless block
+        raise ArgumentError, "with_metadata must be boolean" unless with_metadata == true || with_metadata == false
+        register_callback(kind) do |sender, packet, info|
+          with_metadata ? block.call(sender, packet, info) : block.call(sender, packet)
         end
       end
 
@@ -974,6 +1063,12 @@ module EltenAPI
           participant_id: session.participant_id,
           timeout: CONTROL_TIMEOUT
         )
+      end
+
+      def random_request(session, operation, params, retries: 2, timeout: 45, cancellation_token: nil, check_capacity: false)
+        http = EltenLink::Apps.live_session_random_request(session.id, session.participant_id, operation, params)
+        request = queue_live_request(session, operation, params, retries: retries, timeout: timeout, check_capacity: check_capacity, http: http)
+        await_live_request(request, cancellation_token: cancellation_token)
       end
 
       def stack_request(session, operation, params, retries: 2, timeout: 120, cancellation_token: nil, check_capacity: false)
@@ -1448,7 +1543,9 @@ module EltenAPI
           index && @stack_requests.delete_at(index)
         end
         return unless request
-        if request[:operation] == :push
+        if [:random, :stack_random].include?(request[:operation])
+          request[:session].validate_random_request!(request[:operation], request[:params], capacity: request[:check_capacity] && request[:attempts].zero?)
+        elsif request[:operation] == :push
           request[:session].validate_stack_push!(JSON.generate(request[:params]["packet"]).bytesize, capacity: request[:check_capacity] && request[:attempts].zero?)
         end
         @stack_pending = request
