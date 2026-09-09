@@ -604,9 +604,10 @@ end
 @postcur = 0
 @fields = []
 fdate=""
+comments_count = @posts.size - 1
 for i in 0..@posts.size-1
 field_index=(i==0?i:(i+2))
-@fields[field_index] = EditBox.new(@posts[i].author,type: EditBox::Flags::MultiLine|EditBox::Flags::ReadOnly|EditBox::Flags::HTML,text: format(@posts[i]),quiet: true)
+@fields[field_index] = EditBox.new(@posts[i].author,type: EditBox::Flags::MultiLine|EditBox::Flags::ReadOnly|EditBox::Flags::HTML,text: format(@posts[i], i, comments_count),quiet: true)
 @fields[field_index].audio_url=@posts[i].audio_url if @posts[i].audio_url.to_s!="" && @posts[i].text.to_s.delete(" \r\n")==""
 if i==0
   date = Time.now
@@ -727,7 +728,7 @@ def confirm_comment_discard
   comment_field = @form.fields[@form.fields.size - 4]
   comment_field==nil || comment_field.text=="" || comment_field.text=="\r\n" || confirm(p_("Blog", "Are you sure you want to cancel creating this comment?"))
 end
-def format(post)
+def format(post, comment_number, comments_count)
    date=Time.now
   begin
     date=Time.at(post.date)
@@ -737,7 +738,9 @@ def format(post)
   if text.delete(" \r\n")=="" && post.audio_url!=""
     text=p_("EAPI_Form", "Media")
     end
-  text+"\n\n"+format_date(date)
+  text += "\n\n" + format_date(date)
+  text += "\n#{comment_number}/#{comments_count}" if comment_number > 0
+  text
   end
 def post_has_text?(post)
   post!=nil && post.text.to_s.delete(" \r\n")!=""
