@@ -169,7 +169,6 @@ module GlobalMenu
     }
     if !developer_mode?
     m.option(p_("MainMenu", "Restart in de&veloper mode")) {
-                                  play_sound("logout")
               if !restart_to_developer_mode
                 alert(p_("MainMenu", "Cannot restart in developer mode."))
               end
@@ -183,7 +182,6 @@ module GlobalMenu
               $scene=Scene_Loading.new
     }
     m.option(p_("MainMenu", "Restart in &normal mode")) {
-                                  play_sound("logout")
               if !restart_to_normal_mode
                 alert(p_("MainMenu", "Cannot restart in normal mode."))
               end
