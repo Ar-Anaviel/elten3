@@ -19,10 +19,12 @@ for s in st
         end
       end
     @soundthemes.push(SoundTheme.new(p_("SoundThemes", "default"), nil))
+    move_selected_soundtheme_to_front
   loop_update
-    selected_index = @soundthemes.find_index{|theme| soundtheme_selected?(theme)} || @soundthemes.size-1
-    @selt = soundtheme_labels
-   @sel = ListBox.new(@selt,header: p_("SoundThemes", "Sound themes"), index: selected_index, flags: 0, quiet: false)
+    @selt = @soundthemes.map{|theme| theme.name}
+   @sel = ListBox.new(@selt,header: p_("SoundThemes", "Sound themes"), index: 0, flags: 0, quiet: true)
+    mark_selected_soundtheme
+    @sel.focus
   @sel.bind_context{|menu|context(menu)}
   loop do
 loop_update
@@ -35,10 +37,20 @@ loop_update
     return Configuration.soundtheme==nil if theme.file==nil
     File.basename(theme.file, ".elsnd")==Configuration.soundtheme
   end
-  def soundtheme_labels
-    @soundthemes.map{|theme|
-      soundtheme_selected?(theme) ? p_("SoundThemes", "%{theme} (selected)")%{:theme=>theme.name} : theme.name
-    }
+  def move_selected_soundtheme_to_front
+    index=@soundthemes.find_index{|theme| soundtheme_selected?(theme)} || @soundthemes.size-1
+    @soundthemes.unshift(@soundthemes.delete_at(index)) if index>0
+  end
+  def mark_selected_soundtheme
+    label=p_("EAPI_Speech", "Pinned")
+    @sel.set_item_status(0, "listbox_itempinned", label, label)
+  end
+  def refresh_soundthemes
+    move_selected_soundtheme_to_front
+    @selt=@soundthemes.map{|theme| theme.name}
+    @sel.options=@selt
+    @sel.index=0
+    mark_selected_soundtheme
   end
   def update
     $scene = Scene_Main.new if key_pressed?(:key_escape)
@@ -86,8 +98,7 @@ stdownload
             end
             use_soundtheme(theme.file)
                                    writeconfig("Interface", "SoundTheme", Configuration.soundtheme)
-                @selt = soundtheme_labels
-                @sel.options = @selt
+                refresh_soundthemes
                 alert(_("Saved"))
                           return true
                           }
