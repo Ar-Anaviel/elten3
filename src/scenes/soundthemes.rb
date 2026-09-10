@@ -42,7 +42,7 @@ loop_update
     @soundthemes.unshift(@soundthemes.delete_at(index)) if index>0
   end
   def mark_selected_soundtheme
-    label=p_("EAPI_Speech", "Pinned")
+    label=p_("SoundThemes", "Selected")
     @sel.set_item_status(0, "listbox_itempinned", label, label)
   end
   def refresh_soundthemes
