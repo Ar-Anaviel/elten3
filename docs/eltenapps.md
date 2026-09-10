@@ -5,7 +5,7 @@
 This document describes applications hosted by the Elten desktop client: how their code is loaded, what the runtime does and does not isolate, how an application participates in the interface, and how development packages are built. It is an orientation guide for contributors, not a complete or stable API reference.
 
 > [!IMPORTANT]
-> The application system in Elten 3.0 should be treated as experimental. Elten 3.1 is planned as the release in which Elten applications reach their intended full shape and stability, including concrete, published rules for package signing and verification. Current manifests, lifecycle hooks, certificates, trust roots, package details and helper APIs may therefore change before that point.
+> The application system and its API remain experimental in Elten 3.0. Stabilisation is planned only for Elten 3.1, including concrete, published rules for package signing and verification. Current manifests, lifecycle hooks, certificates, trust roots, package details and helper APIs may therefore change before that point.
 >
 > This status is not intended to discourage writing applications, testing the runtime or proposing improvements. Practical experiments during Elten 3.0 are welcome and are valuable to the design. The warning defines the present compatibility boundary and the planned stabilisation point; it does not ask developers to wait for Elten 3.1 before trying the platform.
 
@@ -594,7 +594,7 @@ encryption.
 - `live_sessions` provides small, ephemeral sessions over Elten's shared runtime transport;
 - server-application helpers register metadata and access application tables or resources.
 
-These areas are especially subject to the Elten 3.0 experimental status. Use the existing helpers rather than writing directly into global menu collections, and discuss additions to the event vocabulary or server contract before depending on them.
+These areas are especially subject to the experimental status of the Elten 3.0 application API, whose stabilisation is planned for Elten 3.1. Use the existing helpers rather than writing directly into global menu collections, and discuss additions to the event vocabulary or server contract before depending on them.
 
 ## Building packages
 

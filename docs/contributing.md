@@ -4,7 +4,7 @@
 
 Thank you for considering a contribution to Elten. This guide covers the contribution workflow, project history and compatibility context, interface and localisation conventions, testing and pull requests. Instructions for running and packaging the client are in [Building Elten 3](building.md), while the runtime model and source layout are described in [Elten 3 architecture](architecture.md).
 
-Elten 3.0 is currently a release candidate. Server API contracts, Ruby interfaces, configuration keys and packaging details may change while the architecture settles.
+Elten 3.0 is a stable release. The [hosted application API](eltenapps.md) remains experimental: its interfaces, manifests, lifecycle hooks and package signing and verification rules may change before the planned stabilisation in Elten 3.1.
 
 ## Reading a long-lived codebase
 
@@ -146,7 +146,7 @@ Do not include tokens, credentials or private message content in a public report
 
 In the pull request description, include the motivation, the approach taken, the affected elements and the checks performed.
 
-Review may identify compatibility or interface-consistency concerns that are not visible from the changed code alone. Be prepared to adjust public interfaces while Elten 3 remains a release candidate.
+Review may identify compatibility or interface-consistency concerns that are not visible from the changed code alone. Changes to public interfaces should account for existing users and integrations. The hosted application API may still be revised before its planned stabilisation in Elten 3.1.
 
 By submitting a pull request, you confirm that you have the right to contribute its contents and agree that the contribution may be used in EltenLink, applications which depend on it, and other projects developed by the Prowadnica Foundation and Dawid Pieper.
 
