@@ -91,9 +91,9 @@ module GlobalMenu
     }
     end
     @menu.submenu(p_("MainMenu", "&Programs")) {|m|
-    list=Programs.list
+    list=Programs.list.reject{|program|program.hidden?}.sort_by {|program| EltenSystemHelpers.locale_sort_key((program.menu_label||program.name||program.to_s).to_s.delete("&"))}
     for prg in list
-      m.scene(prg.menu_label||prg.name||prg.to_s, prg) if !prg.hidden?
+      m.scene(prg.menu_label||prg.name||prg.to_s, prg)
       end
     m.scene(p_("MainMenu", "Programs management"), Scene_Programs)
     }
