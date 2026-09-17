@@ -417,7 +417,14 @@ module EltenLink
         true
       end
 
-      def create_live_session(client, appid:, instance_id:, metadata: {}, participant_metadata: {}, capacity: 2, visibility: :private, join_code: nil, discovery_metadata: {}, stack_entry_bytes: 256, stack_entries: 0, pool_count: 0, private_messages: false)
+      def create_live_session(client, appid:, instance_id:, metadata: {}, participant_metadata: {}, capacity: 2, visibility: :private, join_code: nil, discovery_metadata: {}, hide_participants: false, stack_entry_bytes: 256, stack_entries: 0, pool_count: 0, private_messages: false)
+        raise ArgumentError, "hide_participants must be boolean" unless hide_participants == true || hide_participants == false
+        if hide_participants
+          discovery = client.api_data("GET", "/api/v1/apps/live-sessions/discover", { "appid" => appid, "instance_id" => instance_id, "sources" => "created", "limit" => 1 })
+          unless discovery.dig("limits", "hide_participants") == true
+            raise Error.new("Server does not support hiding live session participants", code: "apps.live_sessions.discovery_unsupported")
+          end
+        end
         client.api_data(
           "POST",
           "/api/v1/apps/live-sessions",
@@ -429,7 +436,7 @@ module EltenLink
             "capacity" => capacity,
             "stack_entry_bytes" => stack_entry_bytes,
             "stack_entries" => stack_entries, "pool_count" => pool_count, "private_messages" => private_messages,
-            "visibility" => visibility.to_s, "join_code" => join_code, "discovery_metadata" => discovery_metadata
+            "visibility" => visibility.to_s, "join_code" => join_code, "discovery_metadata" => discovery_metadata, "hide_participants" => hide_participants
           }
         )
       end
@@ -481,6 +488,10 @@ module EltenLink
           ["GET", "#{path}/discover", params]
         when :find_by_code
           ["POST", "#{path}/resolve-code", params]
+        when :refresh
+          ["GET", "#{live_session_path(session_id)}/discovery", params]
+        when :update_metadata
+          ["PUT", "#{live_session_path(session_id)}/discovery-metadata", params]
         when :join, :accept, :reject
           ["POST", "#{live_session_path(session_id)}/#{operation}", params]
         else

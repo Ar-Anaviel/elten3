@@ -554,6 +554,38 @@ session.invite("alice")
 session.invite("bob", metadata: { "role" => "reviewer" })
 ```
 
+Public sessions can also expose a participant preview and a small status object:
+
+```ruby
+session = live_sessions.create(
+  visibility: :public,
+  capacity: 4,
+  hide_participants: false,
+  discovery_metadata: { "status" => "waiting" }
+)
+session.update_discovery_metadata({ "status" => "playing", "round" => 2 })
+session.on_discovery_metadata_changed do |metadata|
+  Log.info(metadata["status"])
+end
+```
+
+`hide_participants` defaults to `false` and can only be set when creating a session, including through `connect`. Setting it to `true` hides the public participant preview. Membership lists inside a joined session and existing invitations retain their previous behaviour. The participant count remains available.
+
+`discovery_metadata` is a JSON object limited to 1,024 bytes after JSON encoding. Only the current owner can update it. Each update replaces the whole object; `{}` clears it. Updates reach discovery results and joined participants through the existing transport. The callback receives an immutable copy of the metadata for that change. The separate session `metadata` and participant metadata keep their existing meaning and are not exposed by discovery.
+
+```ruby
+preview = live_sessions.discover_sessions(sources: [:public]).first
+if preview
+  preview.refresh
+  users = preview.participants&.map { |participant| participant["user"] }
+  status = preview.discovery_metadata["status"]
+end
+```
+
+A discovered session exposes `hide_participants?` and `participants`. The latter is an immutable array of hashes containing `"id"` and `"user"`, or `nil` when the list is unavailable, hidden or the session is private. `refresh` updates the same discovered-session object and returns it, without joining, reserving a place or extending the session lifetime. Private sessions retain discovery access through ownership, invitations or a join code. Refresh renews a valid discovery token; after its five-minute expiry, discover the session again or use `find_by_code` again.
+
+Existing applications can keep their current calls and message callbacks. Older clients ignore the new metadata event and continue acknowledging events normally. New optional operations check server capabilities; in particular, requesting `hide_participants: true` on an unsupported server fails before creation. Ordinary creation still works without those capabilities.
+
 Incoming invitations are asynchronous:
 
 ```ruby
@@ -578,8 +610,8 @@ the highest consumed cursor. A successful `send` means that the server
 accepted the event, not that every participant executed its callback.
 
 Live sessions are deliberately ephemeral, bounded and server-readable. They
-accept JSON-compatible values, have no public directory and allocate no
-dedicated socket. Use `communication` when an app needs binary payloads,
+accept JSON-compatible values, support discovery within the same application
+and allocate no dedicated socket. Use `communication` when an app needs binary payloads,
 unreliable delivery, per-recipient delivery reports or separate session
 encryption.
 

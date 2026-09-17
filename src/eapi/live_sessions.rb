@@ -352,14 +352,39 @@ module EltenAPI
 
     class DiscoveredSession
       attr_reader :id, :visibility, :discovery_metadata, :created_at, :state, :capacity, :participant_count,
-        :available_slots, :can_join, :join_reason, :invitation, :discovery_context, :discovery_token_expires_at, :limits
+        :available_slots, :can_join, :join_reason, :invitation, :discovery_context, :discovery_token_expires_at, :limits, :hide_participants, :participants
       alias can_join? can_join
+      alias hide_participants? hide_participants
 
       def initialize(endpoint, data)
         @endpoint = endpoint
+        apply_snapshot(data)
+      end
+
+      def refresh(timeout: 45, cancellation_token: nil)
+        raise DiscoveryUnsupported, "Server does not support refreshing discovered sessions" unless @limits["discovery_refresh"] == true
+        data = @endpoint.refresh_discovered_session(@id, @discovery_token, timeout: timeout, cancellation_token: cancellation_token)
+        apply_snapshot(data)
+        self
+      end
+
+      def join(participant_metadata: {}, timeout: 45, cancellation_token: nil)
+        @endpoint.join_discovered_session(@id, @discovery_token, participant_metadata,
+          timeout: timeout, cancellation_token: cancellation_token)
+      end
+
+      def inspect
+        "#<#{self.class} id=#{@id.inspect} visibility=#{@visibility.inspect}>"
+      end
+
+      private
+
+      def apply_snapshot(data)
         @id = data["id"].to_s
         @visibility = data["visibility"].to_s.to_sym
         @state = data["state"].to_s.to_sym
+        @hide_participants = data["hide_participants"] == true
+        @participants = data["participants"].is_a?(Array) ? LiveSessions.immutable_copy(data["participants"]) : nil
         @discovery_metadata = LiveSessions.immutable_copy(data["discovery_metadata"] || {})
         @created_at, @capacity = data["created_at"].to_i, data["capacity"].to_i
         @participant_count, @available_slots = data["participant_count"].to_i, data["available_slots"].to_i
@@ -370,15 +395,6 @@ module EltenAPI
         @discovery_token = data["discovery_token"].to_s
         @discovery_token_expires_at = data["discovery_token_expires_at"].to_i
         @limits = LiveSessions.immutable_copy(data["limits"] || {})
-      end
-
-      def join(participant_metadata: {}, timeout: 45, cancellation_token: nil)
-        @endpoint.join_discovered_session(@id, @discovery_token, participant_metadata,
-          timeout: timeout, cancellation_token: cancellation_token)
-      end
-
-      def inspect
-        "#<#{self.class} id=#{@id.inspect} visibility=#{@visibility.inspect}>"
       end
     end
 
@@ -435,7 +451,8 @@ module EltenAPI
       private_constant :MISSING_PACKET
 
       attr_reader :id, :metadata, :capacity, :owner_id, :participant_id, :state, :limits,
-        :visibility, :join_code, :discovery_metadata, :discovery_context, :join_context
+        :visibility, :join_code, :discovery_metadata, :discovery_context, :join_context, :hide_participants
+      alias hide_participants? hide_participants
 
       def initialize(endpoint, data)
         @endpoint = endpoint
@@ -482,6 +499,19 @@ module EltenAPI
       def invite(user, metadata: {})
         ensure_open!
         @endpoint.invite(self, user, metadata)
+      end
+
+      def update_discovery_metadata(metadata, timeout: 45, cancellation_token: nil)
+        ensure_open!
+        raise NotOwner, "Only the session owner can update discovery metadata" unless owner?
+        raise DiscoveryUnsupported, "Server does not support updating discovery metadata" unless @limits["discovery_metadata_updates"] == true
+        raise ArgumentError, "discovery_metadata must be a Hash" unless metadata.is_a?(Hash)
+        encoded = JSON.generate(metadata)
+        maximum = @limits.fetch("max_discovery_metadata_bytes", 1024).to_i
+        raise ArgumentError, "Discovery metadata exceeds #{maximum} bytes" if encoded.bytesize > maximum
+        data = @endpoint.update_discovery_metadata(self, JSON.parse(encoded), timeout: timeout, cancellation_token: cancellation_token)
+        apply_snapshot(data)
+        @discovery_metadata
       end
 
       def invite_all(users, metadata: {})
@@ -803,6 +833,7 @@ module EltenAPI
       def on_message(with_metadata: false, &block); register_message_callback(:message, with_metadata, &block); end
       def on_participant_joined(&block); register_callback(:participant_joined, &block); end
       def on_participant_left(&block); register_callback(:participant_left, &block); end
+      def on_discovery_metadata_changed(&block); register_callback(:discovery_metadata_changed, &block); end
       def on_gap(&block); register_callback(:gap, &block); end
       def on_closed(&block); register_callback(:closed, &block); end
 
@@ -1014,6 +1045,7 @@ module EltenAPI
           @metadata ||= {}
           @visibility = (data["visibility"] || @visibility || :private).to_sym
           @private_messages = data["private_messages"] == true if data.key?("private_messages")
+          @hide_participants = data["hide_participants"] == true if data.key?("hide_participants") || @hide_participants.nil?
           @join_code = data["join_code"] if data.key?("join_code")
           @discovery_metadata = LiveSessions.immutable_copy(data["discovery_metadata"]) if data["discovery_metadata"].is_a?(Hash)
           @discovery_metadata ||= {}.freeze
@@ -1071,6 +1103,8 @@ module EltenAPI
             removed || Participant.new(row)
           end
           emit(:participant_left, item, event["reason"].to_s.to_sym)
+        when "discovery_metadata_changed"
+          emit(:discovery_metadata_changed, LiveSessions.immutable_copy(event["discovery_metadata"])) if event["discovery_metadata"].is_a?(Hash)
         when "gap"
           emit(:gap, event["from"].to_i, event["to"].to_i)
         when "closed"
@@ -1171,9 +1205,10 @@ module EltenAPI
         LiveSessions.register(self)
       end
 
-      def create(metadata: {}, participant_metadata: {}, capacity: 2, visibility: :private, join_code: nil, discovery_metadata: {}, timeout: 45, cancellation_token: nil, stack_entry_bytes: DEFAULT_STACK_ENTRY_BYTES, stack_entries: DEFAULT_STACK_ENTRIES, pool_count: DEFAULT_POOL_COUNT, private_messages: false)
+      def create(metadata: {}, participant_metadata: {}, capacity: 2, visibility: :private, join_code: nil, discovery_metadata: {}, hide_participants: false, timeout: 45, cancellation_token: nil, stack_entry_bytes: DEFAULT_STACK_ENTRY_BYTES, stack_entries: DEFAULT_STACK_ENTRIES, pool_count: DEFAULT_POOL_COUNT, private_messages: false)
         ensure_open!
         raise ArgumentError, "private_messages must be boolean" unless private_messages == true || private_messages == false
+        raise ArgumentError, "hide_participants must be boolean" unless hide_participants == true || hide_participants == false
         raise ArgumentError, "stack_entry_bytes must be a positive integer" unless stack_entry_bytes.is_a?(Integer) && stack_entry_bytes.positive?
         [stack_entries, pool_count].each do |value|
           raise ArgumentError, "Stack and pool capacities must be non-negative integers" unless value.is_a?(Integer) && value >= 0
@@ -1184,12 +1219,20 @@ module EltenAPI
         raise ArgumentError, "discovery_metadata must be a Hash" unless discovery_metadata.is_a?(Hash)
         maximum = @limits.fetch("max_discovery_metadata_bytes", 1024).to_i
         raise ArgumentError, "Discovery metadata exceeds #{maximum} bytes" if JSON.generate(discovery_metadata).bytesize > maximum
+        if hide_participants && @limits["hide_participants"] != true
+          discover_sessions(sources: [:created], limit: 1, timeout: timeout, cancellation_token: cancellation_token)
+          raise DiscoveryUnsupported, "Server does not support hiding live session participants" unless @limits["hide_participants"] == true
+        end
         data = discovery_request(:create,
           { "metadata" => metadata, "participant_metadata" => participant_metadata, "capacity" => capacity,
-            "visibility" => visibility, "join_code" => join_code, "discovery_metadata" => discovery_metadata,
+            "visibility" => visibility, "join_code" => join_code, "discovery_metadata" => discovery_metadata, "hide_participants" => hide_participants,
             "stack_entry_bytes" => stack_entry_bytes, "stack_entries" => stack_entries, "pool_count" => pool_count, "private_messages" => private_messages },
           timeout: timeout, cancellation_token: cancellation_token, retries: 0)
         session = store_session(data)
+        if hide_participants && !session.hide_participants?
+          session.close_local(:unsupported, operation: :close)
+          raise DiscoveryUnsupported, "Server did not hide live session participants"
+        end
         if private_messages && (session.limits["private_messages"] != true || !session.private_messages?)
           session.close_local(:unsupported)
           raise PrivateMessagesUnsupported, "Server did not enable private live session messages"
@@ -1209,9 +1252,9 @@ module EltenAPI
         session
       end
 
-      def connect(user, metadata: {}, participant_metadata: {}, capacity: 2, timeout: 10, stack_entry_bytes: DEFAULT_STACK_ENTRY_BYTES, stack_entries: DEFAULT_STACK_ENTRIES, visibility: :private, join_code: nil, discovery_metadata: {}, pool_count: DEFAULT_POOL_COUNT, private_messages: false)
+      def connect(user, metadata: {}, participant_metadata: {}, capacity: 2, timeout: 10, stack_entry_bytes: DEFAULT_STACK_ENTRY_BYTES, stack_entries: DEFAULT_STACK_ENTRIES, visibility: :private, join_code: nil, discovery_metadata: {}, hide_participants: false, pool_count: DEFAULT_POOL_COUNT, private_messages: false)
         session = create(metadata: metadata, participant_metadata: participant_metadata, capacity: capacity,
-          stack_entry_bytes: stack_entry_bytes, stack_entries: stack_entries, visibility: visibility, join_code: join_code, discovery_metadata: discovery_metadata, pool_count: pool_count, private_messages: private_messages)
+          stack_entry_bytes: stack_entry_bytes, stack_entries: stack_entries, visibility: visibility, join_code: join_code, discovery_metadata: discovery_metadata, hide_participants: hide_participants, pool_count: pool_count, private_messages: private_messages)
         session.invite(user)
         session.wait_for_participant(user, timeout: timeout)
         session
@@ -1237,6 +1280,10 @@ module EltenAPI
       def find_by_code(code, timeout: 45, cancellation_token: nil)
         data = discovery_request(:find_by_code, { "code" => normalize_join_code(code) }, timeout: timeout, cancellation_token: cancellation_token)
         DiscoveredSession.new(self, data)
+      end
+
+      def refresh_discovered_session(id, discovery_token, timeout: 45, cancellation_token: nil)
+        discovery_request(:refresh, { "discovery_token" => discovery_token }, session_id: id, timeout: timeout, cancellation_token: cancellation_token)
       end
 
       def join_discovered_session(id, discovery_token, participant_metadata, timeout: 45, cancellation_token: nil)
@@ -1369,6 +1416,14 @@ module EltenAPI
           participant_id: session.participant_id,
           timeout: CONTROL_TIMEOUT
         )
+      end
+
+      def update_discovery_metadata(session, metadata, timeout: 45, cancellation_token: nil)
+        ensure_session!(session)
+        params = { "discovery_metadata" => metadata, "participant_id" => session.participant_id }
+        http = EltenLink::Apps.live_session_discovery_request(:update_metadata, params, session_id: session.id)
+        request = queue_live_request(session, :update_metadata, params, retries: 0, timeout: timeout, http: http)
+        await_live_request(request, cancellation_token: cancellation_token)
       end
 
       def private_request(session, params, retries: 2, timeout: 45, cancellation_token: nil)
