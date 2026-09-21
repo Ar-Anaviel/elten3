@@ -387,6 +387,9 @@ module Bass
       def default?
         (@flags&2)!=0
       end
+      def default_alias?
+        default? && @driver==""
+      end
       def initialized?
         (@flags&4)!=0
       end
@@ -478,7 +481,7 @@ module Bass
                   index+=1
                   next
                 end
-                driver=""
+                driver=c_string(a[1])
                 flags=a[2]
                 cds[sc]||=0
                                 cds[sc]+=1
