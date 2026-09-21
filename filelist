@@ -35,6 +35,7 @@ src/eltenlink/__eltenlink.rb
 src/eltenlink/error.rb
 src/eltenlink/client.rb
 src/eltenlink/relay.rb
+src/eltenlink/relay_p2p.rb
 src/eltenlink/attachments.rb
 src/eltenlink/users.rb
 src/eltenlink/contacts.rb

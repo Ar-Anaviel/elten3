@@ -10,6 +10,7 @@ require "monitor"
 require "zlib"
 
 require_relative "../eltenlink/relay" unless defined?(::EltenLink::Relay)
+require_relative "../eltenlink/relay_p2p" unless defined?(::EltenLink::Relay::P2PTransport)
 
 module EltenAPI
   module Communication
@@ -443,7 +444,7 @@ module EltenAPI
     end
 
     class Session
-      attr_reader :id, :metadata, :capacity, :encryption, :owner_id, :state, :self_id
+      attr_reader :id, :metadata, :capacity, :encryption, :owner_id, :state, :self_id, :p2p, :p2p_participants_limit
 
       def initialize(endpoint, data)
         @endpoint = endpoint
@@ -458,6 +459,10 @@ module EltenAPI
         @receive_requested = false
         @state = :open
         apply_snapshot(data)
+      end
+
+      def p2p_status
+        @endpoint.p2p_status(@id)
       end
 
       def participants
@@ -675,6 +680,8 @@ module EltenAPI
         @id = data["id"].to_s
         @metadata = data["metadata"].is_a?(Hash) ? data["metadata"] : {}
         @capacity = data["capacity"].to_i
+        @p2p = %w[partial full].include?(data["p2p"]) ? data["p2p"].to_sym : :off
+        @p2p_participants_limit = data.fetch("p2p_participants_limit", 2).to_i
         @public = data["public"] == true
         @encryption = data["encryption"].to_i
         @owner_id = data["owner_id"].to_s
@@ -776,6 +783,8 @@ module EltenAPI
         @last_error = nil
         @invitation_queue = EventQueue.new
         @received = {}
+        @received_reliable = {}
+        @next_received_cleanup = 0.0
         @received_mutex = Mutex.new
         @message_serial = SecureRandom.random_number(1 << 48)
         @closed = false
@@ -799,14 +808,14 @@ module EltenAPI
         raise
       end
 
-      def create_session(metadata: {}, participant_metadata: {}, capacity: 2, public: false, encryption: 192)
+      def create_session(metadata: {}, participant_metadata: {}, capacity: 2, public: false, encryption: 192, p2p: :off, p2p_participants_limit: 2)
         result = relay_call do
           @relay.create_session(
             metadata: metadata,
             participant_metadata: participant_metadata,
             capacity: capacity,
             public_state: public,
-            encryption: encryption
+            encryption: encryption, p2p: p2p, p2p_participants_limit: p2p_participants_limit
           )
         end
         store_session(result)
@@ -826,9 +835,9 @@ module EltenAPI
 
       alias join_public_session join
 
-      def connect(user, metadata: {}, participant_metadata: {}, encryption: 192, timeout: 10)
+      def connect(user, metadata: {}, participant_metadata: {}, encryption: 192, timeout: 10, p2p: :off, p2p_participants_limit: 2)
         session = create_session(metadata: metadata, participant_metadata: participant_metadata,
-                                 capacity: 2, encryption: encryption)
+                                 capacity: 2, encryption: encryption, p2p: p2p, p2p_participants_limit: p2p_participants_limit)
         invitation = session.invite(user)
         invitation.wait_until_accepted(timeout: timeout)
         session.wait_for_participant(user, timeout: timeout)
@@ -852,6 +861,10 @@ module EltenAPI
 
       def next_invitation(timeout: nil)
         @invitation_queue.pop(timeout: timeout, pump: -> { wait_step })
+      end
+
+      def p2p_status(session_id)
+        @relay.p2p_status(session_id)
       end
 
       def fast_path?
@@ -1308,7 +1321,7 @@ module EltenAPI
         kind = (frame["kind"] || "unreliable").to_sym
         sender_id = frame["sender_id"].to_s
         message_id = frame["message_id"].to_i
-        if duplicate_message?(session.id, sender_id, message_id, kind)
+        if duplicate_message?(session.id, sender_id, message_id, kind, retain_reliable: session.p2p == :full)
           acknowledge(relay, session.id, sender_id, message_id, "delivered") if kind == :reliable
           return
         end
@@ -1325,7 +1338,7 @@ module EltenAPI
           acknowledge(relay, session.id, sender_id, message_id, "failed") if kind == :reliable
           return
         end
-        remember_message(session.id, sender_id, message_id, kind)
+        remember_message(session.id, sender_id, message_id, kind, retain_reliable: session.p2p == :full)
         acknowledge(relay, session.id, sender_id, message_id, "delivered") if kind == :reliable
       rescue StaleKey
         buffer_event(relay, frame)
@@ -1415,12 +1428,29 @@ module EltenAPI
         end
       end
 
-      def duplicate_message?(session_id, sender_id, message_id, kind)
-        @received_mutex.synchronize { @received.key?([session_id, sender_id, message_id, kind]) }
+      def duplicate_message?(session_id, sender_id, message_id, kind, retain_reliable: false)
+        @received_mutex.synchronize do
+          key = [session_id, sender_id, message_id, kind]
+          return @received.key?(key) unless kind == :reliable && retain_reliable
+          now = monotonic
+          if now >= @next_received_cleanup
+            @received_reliable.delete_if { |_id, time| now - time > 120 }
+            @next_received_cleanup = now + 1
+          end
+          return true if @received_reliable.key?(key)
+          # Never evict a live reliable receipt under unreliable traffic: a
+          # direct retransmission or relay fallback must not execute it twice.
+          raise QueueOverflow, "Reliable receipt cache is full" if @received_reliable.size >= 65_536
+          false
+        end
       end
 
-      def remember_message(session_id, sender_id, message_id, kind)
+      def remember_message(session_id, sender_id, message_id, kind, retain_reliable: false)
         @received_mutex.synchronize do
+          if kind == :reliable && retain_reliable
+            @received_reliable[[session_id, sender_id, message_id, kind]] = monotonic
+            return
+          end
           @received[[session_id, sender_id, message_id, kind]] = monotonic
           @received.shift while @received.size > 4096
         end
