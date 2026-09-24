@@ -55,18 +55,28 @@ def recover_elten_error(error, scene)
   end
 end
 def execute_scene_main(scene)
-  if defined?(Program) && scene.is_a?(Program) && scene.respond_to?(:program_main, true)
-    begin
-      result = scene.__send__(:program_main)
-    rescue StandardError
-      scene.finalize(reason: :error)
-      raise
+  with_scene_context(scene) do
+    if defined?(Program) && scene.is_a?(Program) && scene.respond_to?(:program_main, true)
+      begin
+        result = scene.__send__(:program_main)
+      rescue StandardError
+        scene.finalize(reason: :error)
+        raise
+      else
+        scene.finalize(result, reason: :normal)
+      end
     else
-      scene.finalize(result, reason: :normal)
+      scene.main
     end
-  else
-    scene.main
   end
+end
+
+def with_scene_context(scene)
+  previous = Thread.current.thread_variable_get(:elten_scene)
+  Thread.current.thread_variable_set(:elten_scene, scene)
+  yield
+ensure
+  Thread.current.thread_variable_set(:elten_scene, previous)
 end
 
 def insert_scene(scene, must=false, return_to_main: false)

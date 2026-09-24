@@ -768,6 +768,7 @@ module EltenAPI
         @callback_queue = EventQueue.new
         @event_mutex = Monitor.new
         @protocol_mutex = Mutex.new
+        @dispatch_mutex = Mutex.new
         @context = context || (Object.new.extend(EltenAPI) if defined?(EltenAPI::UI))
         @pending_events = Hash.new { |hash, key| hash[key] = [] }
         @pending_event_bytes = 0
@@ -895,26 +896,7 @@ module EltenAPI
       end
 
       def dispatch_events(limit = 100)
-        return 0 if @dispatching
-        @dispatching = true
-        count = 0
-        started = monotonic
-        begin
-          while count < limit && monotonic - started < 0.01
-            entry = @callback_queue.pop(timeout: 0)
-            break unless entry
-            callback, arguments = entry
-            begin
-              callback.call(*arguments)
-            rescue Exception => error
-              Log.warning("Communication callback failed: #{error.class}: #{error.message}") if defined?(Log)
-            end
-            count += 1
-          end
-        ensure
-          @dispatching = false
-        end
-        count
+        dispatch_callbacks(limit)
       end
 
       def callbacks_pending?
@@ -1153,6 +1135,34 @@ module EltenAPI
       end
 
       private
+
+      def dispatch_scene_events(scene)
+        return 0 unless @context.equal?(scene)
+        dispatch_callbacks(32, scene)
+      end
+
+      def dispatch_callbacks(limit, scene = nil)
+        return 0 unless @dispatch_mutex.try_lock
+        count = 0
+        begin
+          started = monotonic
+          while count < limit && monotonic - started < 0.01
+            break if scene && (!Thread.current.equal?($currentthread) || !Thread.current.thread_variable_get(:elten_scene).equal?(scene))
+            entry = @callback_queue.pop(timeout: 0)
+            break unless entry
+            callback, arguments = entry
+            begin
+              callback.call(*arguments)
+            rescue Exception => error
+              Log.warning("Communication callback failed: #{error.class}: #{error.message}") if defined?(Log)
+            end
+            count += 1
+          end
+        ensure
+          @dispatch_mutex.unlock
+        end
+        count
+      end
 
       def relay_event(relay, frame)
         return unless frame.is_a?(Hash) && !closed?
@@ -1557,6 +1567,11 @@ module EltenAPI
       end
 
       private
+
+      def dispatch_scene_events(scene)
+        current = endpoints_mutex.synchronize { endpoints.dup }
+        current.each { |endpoint| endpoint.__send__(:dispatch_scene_events, scene) }
+      end
 
       def endpoints
         @endpoints ||= []

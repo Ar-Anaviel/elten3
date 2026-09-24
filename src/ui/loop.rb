@@ -54,6 +54,17 @@ def dispatch_notification(event, batch_sounds=nil)
   end
 end
 
+def dispatch_parallel_scene_events
+  return unless Thread.current.equal?($currentthread) && !Thread.current.equal?($mainthread)
+  scene = Thread.current.thread_variable_get(:elten_scene)
+  return unless scene
+
+  Programs.with_runtime(Programs.runtime_for(scene)) do
+    EltenAPI::Communication.__send__(:dispatch_scene_events, scene) if defined?(EltenAPI::Communication)
+    EltenAPI::LiveSessions.__send__(:dispatch_scene_events, scene) if defined?(EltenAPI::LiveSessions)
+  end
+end
+
                     # Updates a window, speech api and keyboard state
                     @@call=nil
                     @@missedcalls_window=nil
@@ -98,6 +109,7 @@ end
        EltenAPI::Scheduler.tick if defined?(EltenAPI::Scheduler) && Thread::current == $mainthread
        EltenAPI::Communication.tick if defined?(EltenAPI::Communication) && Thread::current == $mainthread
        EltenAPI::LiveSessions.tick if defined?(EltenAPI::LiveSessions) && Thread::current == $mainthread
+       dispatch_parallel_scene_events
        $input_frame_serial=($input_frame_serial||0)+1
        EltenAPI::Controls::ListBox.tick_audio_players if defined?(EltenAPI::Controls::ListBox)
        Sound.update_slide_events if defined?(Sound) && Thread.current == $mainthread

@@ -467,9 +467,11 @@ module Programs
 
     def main
       program = @program_class.new
-      runtime = Programs.runtime_for(@program_class)
-      result = Programs.with_runtime(runtime) { program.notification_action(@action, @notification) }
-      program.finalize(result, reason: :notification)
+      with_scene_context(program) do
+        runtime = Programs.runtime_for(@program_class)
+        result = Programs.with_runtime(runtime) { program.notification_action(@action, @notification) }
+        program.finalize(result, reason: :notification)
+      end
     rescue Exception => error
       if program != nil
         Programs.handle_execution_error(error, program)

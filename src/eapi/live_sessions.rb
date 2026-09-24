@@ -1218,6 +1218,7 @@ module EltenAPI
         @retry_not_before = 0.0
         @control_rotation = 0
         @protocol_mutex = Mutex.new
+        @dispatch_mutex = Mutex.new
         @limits = {}
         @last_error = nil
         @overflow = false
@@ -1630,12 +1631,23 @@ module EltenAPI
       end
 
       def dispatch_events(limit = 100)
-        return 0 if closed? || @dispatching
-        @dispatching = true
+        dispatch_callbacks(limit)
+      end
+
+      private
+
+      def dispatch_scene_events(scene)
+        return 0 unless @client.respond_to?(:context) && @client.context.equal?(scene)
+        dispatch_callbacks(32, scene)
+      end
+
+      def dispatch_callbacks(limit, scene = nil)
+        return 0 if closed? || !@dispatch_mutex.try_lock
         count = 0
-        started = monotonic
         begin
+          started = monotonic
           while count < limit && monotonic - started < 0.01
+            break if scene && (!Thread.current.equal?($currentthread) || !Thread.current.thread_variable_get(:elten_scene).equal?(scene))
             callback, arguments, _bytes = @mutex.synchronize do
               entry = @callback_queue.pop(true)
               @callback_bytes -= entry[2]
@@ -1651,12 +1663,10 @@ module EltenAPI
         rescue ThreadError
           nil
         ensure
-          @dispatching = false
+          @dispatch_mutex.unlock
         end
         count
       end
-
-      private
 
       def normalize_join_code(code)
         value = code.is_a?(String) ? code.strip.upcase : ""
@@ -2177,6 +2187,11 @@ module EltenAPI
       end
 
       private
+
+      def dispatch_scene_events(scene)
+        current = mutex.synchronize { endpoints.dup }
+        current.each { |endpoint| endpoint.__send__(:dispatch_scene_events, scene) }
+      end
 
       def mutex
         @mutex ||= Mutex.new
