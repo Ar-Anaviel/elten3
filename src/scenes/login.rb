@@ -85,6 +85,7 @@ else
     write_logindata(autologin, name, token, tokenenc)
   end
   end
+  client_info = EltenAPI::NotificationService.client_login_params(refresh_apps: true)
   version_string = login_version_string
   version_islauncher = login_version_islauncher
   version_isdevelopment = login_version_isdevelopment(version_islauncher)
@@ -99,9 +100,9 @@ end
   while suc==false
   begin
   if token!="" && @skipauto!=true
-    logintemp = EltenLink::Authentication.login(elten_link, name: name, token: token, version_string: version_string, version_isdevelopment: version_isdevelopment, version_islauncher: version_islauncher, appid: $appid, language: Configuration.language, os: platform_os, authmethod: "list", stamp: stamp)
+    logintemp = EltenLink::Authentication.login(elten_link, name: name, token: token, version_string: version_string, version_isdevelopment: version_isdevelopment, version_islauncher: version_islauncher, appid: $appid, language: Configuration.language, os: platform_os, authmethod: "list", stamp: stamp, soundtheme: client_info["soundtheme"], apps_uuids: client_info["apps_uuids"])
 else
-  logintemp = EltenLink::Authentication.login(elten_link, name: name, password: password, version_string: version_string, version_isdevelopment: version_isdevelopment, version_islauncher: version_islauncher, appid: $appid, language: Configuration.language, os: platform_os, authmethod: "list", stamp: stamp)
+  logintemp = EltenLink::Authentication.login(elten_link, name: name, password: password, version_string: version_string, version_isdevelopment: version_isdevelopment, version_islauncher: version_islauncher, appid: $appid, language: Configuration.language, os: platform_os, authmethod: "list", stamp: stamp, soundtheme: client_info["soundtheme"], apps_uuids: client_info["apps_uuids"])
 end
 suc=true
 rescue EltenLink::Error => e
@@ -111,9 +112,9 @@ if meth==0
   phone_error=nil
   begin
   if token!=""
-    logintemp = EltenLink::Authentication.login(elten_link, name: name, token: token, version_string: version_string, version_isdevelopment: version_isdevelopment, version_islauncher: version_islauncher, appid: $appid, language: Configuration.language, os: platform_os, authmethod: "phone", stamp: stamp)
+    logintemp = EltenLink::Authentication.login(elten_link, name: name, token: token, version_string: version_string, version_isdevelopment: version_isdevelopment, version_islauncher: version_islauncher, appid: $appid, language: Configuration.language, os: platform_os, authmethod: "phone", stamp: stamp, soundtheme: client_info["soundtheme"], apps_uuids: client_info["apps_uuids"])
 else
-  logintemp = EltenLink::Authentication.login(elten_link, name: name, password: password, version_string: version_string, version_isdevelopment: version_isdevelopment, version_islauncher: version_islauncher, appid: $appid, language: Configuration.language, os: platform_os, authmethod: "phone", stamp: stamp)
+  logintemp = EltenLink::Authentication.login(elten_link, name: name, password: password, version_string: version_string, version_isdevelopment: version_isdevelopment, version_islauncher: version_islauncher, appid: $appid, language: Configuration.language, os: platform_os, authmethod: "phone", stamp: stamp, soundtheme: client_info["soundtheme"], apps_uuids: client_info["apps_uuids"])
 end
   rescue EltenLink::Error => phone_error
   end
@@ -173,6 +174,7 @@ end
   end
 end
     if logintemp != nil
+  EltenAPI::NotificationService.client_logged_in(logintemp, client_info)
   name=logintemp.name
   Session.name=name
       Session.token=logintemp.token

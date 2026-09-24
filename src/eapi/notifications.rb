@@ -23,6 +23,55 @@ module EltenAPI
       LONG_POLL_WAIT_MS = 5_000
       POLL_ERROR_RETRY_INTERVAL = 2.0
 
+      CLIENT_INFO_MUTEX = Mutex.new
+
+      def client_login_params(refresh_apps: false)
+        values = { "appid" => $appid.to_s, "os" => platform_os.to_s, "version_string" => Elten.version.to_s.upcase,
+          "language" => configuration_string(:language), "soundtheme" => configuration_string(:soundtheme) }
+        apps = Programs.client_app_uuids(refresh: refresh_apps)
+        values["apps_uuids"] = apps unless apps.nil?
+        values.transform_values { |value| value.dup.freeze }.freeze
+      end
+
+      def client_logged_in(result, values)
+        CLIENT_INFO_MUTEX.synchronize do
+          @client_info_key = [result.name, result.token]
+          @client_info_confirmed = result.client_updated ? values.dup : {}
+          @client_info_pending = nil
+          @client_info_retry_at = result.client_updated ? 0 : monotonic_time + 60
+        end
+      end
+
+      def client_update_params(key)
+        values = client_login_params
+        CLIENT_INFO_MUTEX.synchronize do
+          return [{}, nil] unless key == @client_info_key
+          return [{}, nil] if monotonic_time < @client_info_retry_at.to_f
+          if @client_info_pending
+            @client_info_pending.last.each_key { |field| @client_info_confirmed.delete(field) }
+            @client_info_pending = nil
+          end
+          changed = values.reject { |field, value| field == "appid" || @client_info_confirmed[field] == value }
+          return [{}, nil] if changed.empty?
+          @client_info_serial = @client_info_serial.to_i + 1
+          @client_info_pending = [@client_info_serial, changed]
+          @client_info_retry_at = monotonic_time + 60
+          [changed, @client_info_serial]
+        end
+      end
+
+      def confirm_client_update(key, serial, response)
+        return unless serial
+        CLIENT_INFO_MUTEX.synchronize do
+          return unless key == @client_info_key && @client_info_pending&.first == serial
+          if response["client_updated"] == true
+            @client_info_confirmed.merge!(@client_info_pending.last)
+            @client_info_pending = nil
+            @client_info_retry_at = 0
+          end
+        end
+      end
+
       def start
         ensure_state
         return true if @thread != nil && @thread.alive?
@@ -389,6 +438,9 @@ module EltenAPI
           "cancellation" => cancellation
         }
         params = notification_request_params(name, token, lasttime, shown)
+        client_params, client_serial = client_update_params(key)
+        params.merge!(client_params)
+        @inflight_requests[request_id]["client_serial"] = client_serial
         params["stream_capability"] = 1
         cursor = realtime_cursor
         params["wait_ms"] = refresh_ticket == nil ? LONG_POLL_WAIT_MS : 0
@@ -530,8 +582,7 @@ module EltenAPI
         params = {
           "stream_id" => @stream_id,
           "shown" => shown ? 1 : 0,
-          "language" => configuration_string(:language),
-          "soundtheme" => configuration_string(:soundtheme),
+          "appid" => $appid.to_s,
           "signal_ack" => acknowledgements
         }
         params["wn_cursor"] = @stream_wn_cursor unless @stream_wn_cursor.to_s.empty?
@@ -539,9 +590,11 @@ module EltenAPI
           "/api/v1/system/realtime-stream/control",
           { "name" => name, "token" => token }
         )
+        client_params, client_serial = client_update_params(key)
+        params.merge!(client_params)
         @stream_control_pending = true
         @stream_control_started_at = now
-        elten_link.e_json_request("POST", path, params, [key, @stream_generation, acknowledgements, shown]) do |answer, data|
+        elten_link.e_json_request("POST", path, params, [key, @stream_generation, acknowledgements, shown, client_serial]) do |answer, data|
           @stream_controls << [answer, data]
         end
       rescue Exception => e
@@ -551,7 +604,7 @@ module EltenAPI
       def drain_stream_controls(limit=10)
         limit.times do
           answer, data = @stream_controls.pop(true)
-          key, generation, acknowledgements, shown = data
+          key, generation, acknowledgements, shown, client_serial = data
           next unless key == @session_key && generation.to_i == @stream_generation.to_i
 
           @stream_control_pending = false
@@ -561,6 +614,7 @@ module EltenAPI
             stream_failed(monotonic_time, reason: "control rejected")
             next
           end
+          confirm_client_update(key, client_serial, payload["data"])
           Array(acknowledgements).each { |id| @pending_signal_acks.delete(id.to_i) }
           @stream_last_shown = shown
           @next_stream_control_at = monotonic_time + STREAM_CONTROL_INTERVAL
@@ -693,12 +747,12 @@ module EltenAPI
           calibrating = info.is_a?(Hash) && info["calibrating"] == true
           refresh_ticket = info.is_a?(Hash) ? info["refresh_ticket"] : nil
           protocol = info.is_a?(Hash) ? info["protocol"] : nil
-          handle_status_response(answer, key, calibrating, request_id, refresh_ticket, protocol)
+          handle_status_response(answer, key, calibrating, request_id, refresh_ticket, protocol, info && info["client_serial"])
           count += 1
         end
       end
 
-      def handle_status_response(answer, key, calibrating=false, request_id=0, refresh_ticket=nil, protocol=nil)
+      def handle_status_response(answer, key, calibrating=false, request_id=0, refresh_ticket=nil, protocol=nil, client_serial=nil)
         return if key != @session_key
         if !answer.is_a?(String)
           schedule_poll_error_retry
@@ -711,6 +765,7 @@ module EltenAPI
           return
         end
 
+        confirm_client_update(key, client_serial, response)
         cursor = response["realtime_cursor"].to_s
         accept_realtime_cursor(cursor, request_id)
         if request_id.to_i >= @stream_capability_request_id.to_i
@@ -1208,8 +1263,7 @@ module EltenAPI
           "name" => name,
           "token" => token,
           "lasttime" => lasttime,
-          "language" => configuration_string(:language),
-          "soundtheme" => configuration_string(:soundtheme),
+          "appid" => $appid.to_s,
           "notifications_hash" => active_notifications_hash,
           "notification_apps" => Array(@notification_apps).join(",")
         }

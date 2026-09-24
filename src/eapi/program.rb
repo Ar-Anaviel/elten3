@@ -29,6 +29,9 @@ module Programs
   @@runtime_by_prefix = {}
   @@runtime_by_root = {}
   @@apps_registry_cache = nil
+  @@client_apps_revision = 0
+  @@client_apps_snapshot = nil
+  @@client_apps_retry_at = 0.0
 
   class ProgramError < StandardError
   end
@@ -2255,6 +2258,7 @@ module Programs
       File.binwrite(tmp, JSON.pretty_generate({ "apps" => apps }))
       FileUtils.mv(tmp, file)
       @@apps_registry_cache = { "apps" => apps }
+      @@client_apps_revision += 1
       true
     rescue Exception => e
       Log.warning("Cannot save apps registry #{file}: #{e.class}: #{e.message}")
@@ -2326,6 +2330,7 @@ module Programs
         remove_app_storage_path(apps_cache_root, storage_id)
         remove_registry_storage(storage_id)
       end
+      @@client_apps_revision += 1
       true
     end
 
@@ -2501,6 +2506,25 @@ module Programs
       entries.size == 1 ? entries[0].to_s : ""
     rescue Exception
       ""
+    end
+
+    def client_app_uuids(refresh: false)
+      @@client_apps_revision += 1 if refresh
+      revision = @@client_apps_revision
+      return @@client_apps_snapshot.last if @@client_apps_snapshot&.first == revision
+      return nil if !refresh && Process.clock_gettime(Process::CLOCK_MONOTONIC) < @@client_apps_retry_at
+      ids = Dir.children(Dirs.apps).reject { |entry| ignored_program_entry?(entry) }.filter_map do |entry|
+        source = discover_source(entry)
+        source[:manifest].id.to_s.downcase if source && source[:manifest]
+      end
+      return nil unless revision == @@client_apps_revision
+      value = ids.select { |id| id.match?(UUID_PATTERN) }.uniq.sort.join(";").freeze
+      @@client_apps_snapshot = [revision, value]
+      value
+    rescue StandardError => error
+      @@client_apps_retry_at = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 60
+      Log.warning("Cannot read client application UUIDs: #{error.class}: #{error.message}")
+      nil
     end
 
     def installed_entries
