@@ -32,6 +32,102 @@ module EltenAPI
       return k
       end
 
+    class FormRegistration
+      def initialize(owner, kind, entry)
+        @owner, @kind, @entry = owner, kind, entry
+        @mutex = Mutex.new
+      end
+
+      def close
+        owner, kind, entry = @mutex.synchronize do
+          return false if @owner == nil
+          current = [@owner, @kind, @entry]
+          @owner = @entry = nil
+          current
+        end
+        owner.__send__(:remove_form_registration, kind, entry)
+        true
+      end
+
+      def closed?
+        @mutex.synchronize { @owner == nil }
+      end
+
+      private
+
+      def owned_by?(owner, kind)
+        @mutex.synchronize { @owner.equal?(owner) && @kind == kind }
+      end
+    end
+    private_constant :FormRegistration
+
+    class FormBindings
+      def initialize(owner: nil)
+        @resources = Resources::Registry.new
+        @mutex = Mutex.new
+        @closed = false
+        @owner = owner
+        owner.manage(self) if owner != nil
+      end
+
+      def on(control, event, time=0, getparams=false, &block)
+        register { control.__send__(:register_event, event, time, getparams, &block) }
+      end
+
+      def context(control, header="", &block)
+        register { control.__send__(:register_context, header, &block) }
+      end
+
+      def timer(form, interval, repeat: false, &block)
+        register { form.__send__(:register_timer, interval, repeat: repeat, &block) }
+      end
+
+      def clear
+        resources = @mutex.synchronize do
+          return 0 if @closed
+          current = @resources
+          @resources = Resources::Registry.new
+          current
+        end
+        resources.close
+      end
+
+      def close
+        resources, owner = @mutex.synchronize do
+          return 0 if @closed
+          @closed = true
+          current = [@resources, @owner]
+          @owner = nil
+          current
+        end
+        begin
+          resources.close
+        ensure
+          owner.release(self) if owner != nil
+        end
+      end
+
+      def closed?
+        @mutex.synchronize { @closed }
+      end
+
+      private
+
+      def register
+        resources = @mutex.synchronize do
+          raise RuntimeError, "form bindings are closed" if @closed
+          @resources
+        end
+        registration = yield
+        begin
+          resources.manage(registration)
+        rescue Exception
+          registration.close
+          raise
+        end
+      end
+    end
+
       class FormBase
         attr_accessor :header
         def params
@@ -39,20 +135,37 @@ module EltenAPI
           @params
           end
         def on(event, time=0, getparams=false, &block)
-      @events||=[]
-      @events.push([event,time,0,getparams,block])
+      register_event(event, time, getparams, &block)
     end
+    def remove_event(registration)
+      return false unless registration.is_a?(FormRegistration) && registration.__send__(:owned_by?, self, :event)
+      registration.close
+    end
+    def register_event(event, time, getparams, &block)
+      @events||=[]
+      entry=[event,time,0,getparams,block]
+      @events.push(entry)
+      FormRegistration.new(self, :event, entry)
+    end
+    def remove_form_registration(kind, entry)
+      entries=kind==:event ? @events : @contexts
+      entry.clear
+      entries.delete_if { |item| item.equal?(entry) }
+    end
+    private :register_event, :remove_form_registration
+
     def trigger(event, *params)
       return if @events==nil
-      @events.each {|e|
-if e[0]==event and e[2]<=Time.now.to_f-e[1]
-e[2]=Time.now.to_f
-a=params
-a||=[]
-a.insert(0, params) if e[3]==true
-e[4].call(a)
-end
-}
+      @events.dup.each do |entry|
+        name, time, last, getparams, block=entry
+        next if entry.empty?
+        if name==event && last<=Time.now.to_f-time
+          entry[2]=Time.now.to_f
+          params.insert(0, params) if getparams==true
+          block.call(params)
+        end
+      end
+      @events
     end
     def wait
       if @announce_wait!=false && (@updated==true || @quiet==true)
@@ -99,10 +212,17 @@ end
     def contextinglobal_enabled?
       @disable_contextinglobal!=true
       end
-                 def bind_context(h="", &b)
-                                  @contexts||=[]
-               @contexts.push([b, h])
-             end
+    def bind_context(h="", &b)
+      register_context(h, &b)
+    end
+    def register_context(header="", &block)
+      @contexts||=[]
+      entry=[block, header]
+      @contexts.push(entry)
+      FormRegistration.new(self, :context, entry)
+    end
+    private :register_context
+
              def hascontext
                return false if @contexts==nil
                return @contexts.size>0
@@ -110,8 +230,9 @@ end
     def context(menu, submenu=true)
       return if submenu && @disable_contextinglobal==true
       @contexts||=[]
-      @contexts.each{|c|
-      s=c[1]
+      @contexts.dup.each{|c|
+      block, s=c
+      next if c.empty?
       s=@header if s=="" and @header.is_a?(String)
       if s==""
         s=_("Context menu")
@@ -120,12 +241,13 @@ end
         end
       if submenu
       menu.submenu(s) {|m|
-      c[0].call(m)
+      block.call(m) unless c.empty?
       }
     else
-      c[0].call(menu)
+      block.call(menu)
       end
       }
+      @contexts
       end
         def keyboard_idle_frame?
           keyboard_input_idle?
@@ -183,14 +305,21 @@ class FormTimer
     @starttime=nil
   end
   def update
-    return if @starttime==nil || @completed==true
-    if Time.now.to_f-@starttime>=@time
-      @action.call if @completed==false && @action!=nil
+    starttime=@starttime
+    return if starttime==nil || @completed==true
+    if Time.now.to_f-starttime>=@time
+      action=@action
+      action.call if @completed==false && action!=nil
+      return if @starttime==nil
       @completed=true
       @starttime=nil
       start if repeat
       end
     end
+  def dispose
+    @starttime=@action=nil
+  end
+  private :dispose
   end
 
     # A form
@@ -307,7 +436,7 @@ if @fields[@index]!=nil && @accept_button!=nil && !@fields[@index].is_a?(Button)
     @accept_button.press
     end
   end
-  @timers.each{|timer|timer.update}
+  update_timers
 end
 def shortcut_pressed?(key, shift: false, first: false)
   return false unless $activecontrols.is_a?(Array) && $activecontrols.include?(self)
@@ -317,8 +446,40 @@ def add_timer(timer, start=true)
   @timers.push(timer) if timer.is_a?(FormTimer)
 end
 def delete_timer(timer)
+  @updating_timers.to_a.each { |timers| timers.map! { |item| item.equal?(timer) ? nil : item } }
   @timers.delete(timer)
   end
+
+def register_timer(interval, repeat: false, &block)
+  timer=FormTimer.new(interval, repeat: repeat, &block)
+  registration=FormRegistration.new(self, :timer, timer)
+  begin
+    add_timer(timer)
+  rescue Exception
+    registration.close
+    raise
+  end
+  registration
+end
+
+def update_timers
+  return @timers if @timers.empty?
+  timers=@timers.dup
+  (@updating_timers||=[]) << timers
+  begin
+    timers.each { |timer| timer.update if timer != nil }
+    @timers
+  ensure
+    @updating_timers.pop
+  end
+end
+
+def remove_form_registration(kind, entry)
+  return super unless kind==:timer
+  entry.__send__(:dispose)
+  delete_timer(entry)
+end
+private :register_timer, :update_timers, :remove_form_registration
                 def append(field)
                   @fields.push(field)
                   return field
