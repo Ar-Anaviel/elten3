@@ -144,7 +144,7 @@ module EltenLink
 
       def list(timeout: nil, cancellation_token: nil)
         data = @client.api_data("GET", path, **request_options(timeout, cancellation_token))
-        @maxsize = data["maxsize"].to_i
+        @maxsize = data.fetch(limit_field, data["maxsize"]).to_i
         @used_size = data["used_size"].to_i
         data["resources"].to_a.map { |row| Apps.resource_from(row, @app_uuid) }
       end
@@ -177,6 +177,14 @@ module EltenLink
         true
       end
 
+      def download(resource, timeout: nil, cancellation_token: nil)
+        @client.api_download("#{path}/#{resource_id(resource)}/download", **request_options(timeout, cancellation_token))
+      end
+
+      def max_public_resources_bytes
+        @maxsize
+      end
+
       def download_url(resource)
         return resource.url.to_s if resource.respond_to?(:url) && resource.url.to_s != ""
 
@@ -184,6 +192,10 @@ module EltenLink
       end
 
       private
+
+      def limit_field
+        "max_public_resources_bytes"
+      end
 
       def request_options(timeout, cancellation_token)
         options = {}
@@ -204,6 +216,24 @@ module EltenLink
         id
       rescue ArgumentError, TypeError
         raise ArgumentError, "Invalid app resource ID"
+      end
+    end
+
+    class AppPrivateResources < AppResources
+      undef_method :maxsize, :max_public_resources_bytes
+
+      def max_private_resources_bytes_per_user
+        @maxsize
+      end
+
+      private
+
+      def limit_field
+        "max_private_resources_bytes_per_user"
+      end
+
+      def path
+        "/api/v1/apps/#{Apps.query_escape(@app_uuid)}/private-resources"
       end
     end
 
@@ -570,23 +600,27 @@ module EltenLink
         true
       end
 
-      def register(client, name:, data: nil, tables: nil, tables_protected: false, notifications: false)
+      def register(client, name:, data: nil, tables: nil, tables_protected: false, notifications: false, max_public_resources_bytes: nil, max_private_resources_bytes_per_user: nil)
         params = { "name" => name.to_s }
         params["data"] = data if data != nil
         params["tables"] = tables if tables != nil
         params["tables_protected"] = tables_protected == true || tables_protected.to_s == "1" || tables_protected.to_s.downcase == "true"
         params["notifications"] = notifications == true || notifications.to_s == "1" || notifications.to_s.downcase == "true"
+        params["max_public_resources_bytes"] = max_public_resources_bytes unless max_public_resources_bytes.nil?
+        params["max_private_resources_bytes_per_user"] = max_private_resources_bytes_per_user unless max_private_resources_bytes_per_user.nil?
         data = client.api_data("POST", "/api/v1/apps", params)
         data.dig("app", "uuid").to_s
       end
 
-      def update(client, uuid, name: nil, data: nil, tables: nil, tables_protected: nil, notifications: nil)
+      def update(client, uuid, name: nil, data: nil, tables: nil, tables_protected: nil, notifications: nil, max_public_resources_bytes: nil, max_private_resources_bytes_per_user: nil)
         params = {}
         params["name"] = name.to_s if name != nil
         params["data"] = data if data != nil
         params["tables"] = tables if tables != nil
         params["tables_protected"] = tables_protected == true || tables_protected.to_s == "1" || tables_protected.to_s.downcase == "true" if tables_protected != nil
         params["notifications"] = notifications == true || notifications.to_s == "1" || notifications.to_s.downcase == "true" if notifications != nil
+        params["max_public_resources_bytes"] = max_public_resources_bytes unless max_public_resources_bytes.nil?
+        params["max_private_resources_bytes_per_user"] = max_private_resources_bytes_per_user unless max_private_resources_bytes_per_user.nil?
         data = client.api_data("PUT", "/api/v1/apps/#{query_escape(uuid)}", params)
         data["app"]
       end
@@ -607,6 +641,10 @@ module EltenLink
 
       def resources(client, uuid)
         AppResources.new(client, uuid)
+      end
+
+      def private_resources(client, uuid)
+        AppPrivateResources.new(client, uuid)
       end
 
       def delete(client, uuid)

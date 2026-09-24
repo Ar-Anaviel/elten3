@@ -359,9 +359,9 @@ module Programs
   end
 
   class ServerAppDefinition
-    attr_reader :uuid, :tables
+    attr_reader :uuid, :tables, :max_public_resources_bytes, :max_private_resources_bytes_per_user
 
-    def initialize(uuid:, tables:, protected:, notifications: false)
+    def initialize(uuid:, tables:, protected:, notifications: false, max_public_resources_bytes: nil, max_private_resources_bytes_per_user: nil)
       value = uuid == nil ? nil : uuid.to_s.strip
       value = nil if value == ""
       raise ProgramError, "Invalid server application UUID #{uuid.inspect}" if value != nil && value !~ UUID_PATTERN
@@ -369,6 +369,11 @@ module Programs
       raise ProgramError, "Server application protection must be a boolean" if protected != true && protected != false
       raise ProgramError, "Server application notification support must be a boolean" if notifications != true && notifications != false
 
+      [max_public_resources_bytes, max_private_resources_bytes_per_user].each do |limit|
+        raise ProgramError, "Resource storage limits must be non-negative integers" unless limit.nil? || limit.is_a?(Integer) && limit >= 0
+      end
+      @max_public_resources_bytes = max_public_resources_bytes
+      @max_private_resources_bytes_per_user = max_private_resources_bytes_per_user
       @uuid = value
       @tables = immutable_copy(tables)
       @protected = protected
@@ -385,7 +390,8 @@ module Programs
     end
 
     def with_uuid(uuid)
-      self.class.new(uuid: uuid, tables: @tables, protected: @protected, notifications: @notifications)
+      self.class.new(uuid: uuid, tables: @tables, protected: @protected, notifications: @notifications,
+        max_public_resources_bytes: @max_public_resources_bytes, max_private_resources_bytes_per_user: @max_private_resources_bytes_per_user)
     end
 
     private
@@ -3375,12 +3381,14 @@ class Program
       @app_info == nil ? const_get(:AppID).to_s : @app_info.id.to_s
     end
 
-    def server_app(uuid: nil, tables: {}, protected: false, notifications: false)
+    def server_app(uuid: nil, tables: {}, protected: false, notifications: false, max_public_resources_bytes: nil, max_private_resources_bytes_per_user: nil)
       @server_app_definition = Programs::ServerAppDefinition.new(
         uuid: uuid,
         tables: tables,
         protected: protected,
-        notifications: notifications
+        notifications: notifications,
+        max_public_resources_bytes: max_public_resources_bytes,
+        max_private_resources_bytes_per_user: max_private_resources_bytes_per_user
       )
     end
 
@@ -3393,14 +3401,16 @@ class Program
       definition == nil ? app_uuid : definition.uuid.to_s
     end
 
-    def register_server_app(name: nil, data: nil, tables: nil, tables_protected: false, notifications: false)
+    def register_server_app(name: nil, data: nil, tables: nil, tables_protected: false, notifications: false, max_public_resources_bytes: nil, max_private_resources_bytes_per_user: nil)
       EltenLink::Apps.register(
         EltenLink.client(self),
         :name => (name || self.name),
         :data => data,
         :tables => tables,
         :tables_protected => tables_protected,
-        :notifications => notifications
+        :notifications => notifications,
+        max_public_resources_bytes: max_public_resources_bytes,
+        max_private_resources_bytes_per_user: max_private_resources_bytes_per_user
       )
     end
 
@@ -3411,7 +3421,9 @@ class Program
       uuid = register_server_app(
         tables: definition.tables,
         tables_protected: definition.protected?,
-        notifications: definition.notifications?
+        notifications: definition.notifications?,
+        max_public_resources_bytes: definition.max_public_resources_bytes,
+        max_private_resources_bytes_per_user: definition.max_private_resources_bytes_per_user
       )
       raise Programs::ProgramError, "Server application registration returned an invalid UUID" if uuid.to_s !~ Programs::UUID_PATTERN
 
@@ -3419,7 +3431,7 @@ class Program
       uuid
     end
 
-    def update_server_app(uuid = nil, name: nil, data: nil, tables: nil, tables_protected: nil, notifications: nil)
+    def update_server_app(uuid = nil, name: nil, data: nil, tables: nil, tables_protected: nil, notifications: nil, max_public_resources_bytes: nil, max_private_resources_bytes_per_user: nil)
       EltenLink::Apps.update(
         EltenLink.client(self),
         uuid || app_uuid,
@@ -3427,7 +3439,9 @@ class Program
         :data => data,
         :tables => tables,
         :tables_protected => tables_protected,
-        :notifications => notifications
+        :notifications => notifications,
+        max_public_resources_bytes: max_public_resources_bytes,
+        max_private_resources_bytes_per_user: max_private_resources_bytes_per_user
       )
     end
 
@@ -3439,7 +3453,9 @@ class Program
         definition.uuid,
         tables: definition.tables,
         tables_protected: definition.protected?,
-        notifications: definition.notifications?
+        notifications: definition.notifications?,
+        max_public_resources_bytes: definition.max_public_resources_bytes,
+        max_private_resources_bytes_per_user: definition.max_private_resources_bytes_per_user
       )
     end
 
@@ -3468,6 +3484,10 @@ class Program
 
     def server_resources(uuid = nil)
       EltenLink::Apps.resources(EltenLink.client(self), server_app_identifier(uuid))
+    end
+
+    def server_private_resources(uuid = nil)
+      EltenLink::Apps.private_resources(EltenLink.client(self), server_app_identifier(uuid))
     end
 
     def delete_server_app(uuid = nil)
@@ -3655,6 +3675,10 @@ class Program
 
   def server_resources(uuid = nil)
     self.class.server_resources(uuid)
+  end
+
+  def server_private_resources(uuid = nil)
+    self.class.server_private_resources(uuid)
   end
 
   def delete_server_app(uuid = nil)
