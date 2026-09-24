@@ -183,6 +183,17 @@ module EltenLink
         end
       end
 
+      def status
+        @mutex.synchronize do
+          {
+            "channel_id" => @channel,
+            "local_enabled" => allowed?,
+            "recipients" => @peers.count { |_id, peer| ready?(peer) },
+            "total_recipients" => @users.count { |id, _user| id != @owner.uid }
+          }
+        end
+      end
+
       def reserve
         @mutex.synchronize { (@media ? @media.overhead : 44) + 3 + @peers.length * 2 }
       end

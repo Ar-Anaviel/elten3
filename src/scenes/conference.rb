@@ -216,6 +216,23 @@ end
     txt+=p_("Conference", "Current latency")+": "+((status['latency']||0)*1000).round.to_s+"ms\n"
     txt+=p_("Conference", "Bytes sent")+": "+(status['sendbytes']||0).to_s+"\n"
     txt+=p_("Conference", "Bytes received")+": "+(status['receivedbytes']||0).to_s
+    channel=Conference.channel
+    if channel.p2p_enabled
+      participants=channel.users.count { |user| !user.waiting }
+      if channel.p2p_participants_limit>0 && participants>channel.p2p_participants_limit
+        txt+="\n"+p_("Conference", "Channel P2P: disabled — participant limit exceeded")
+      else
+        txt+="\n"+p_("Conference", "Channel P2P: enabled")
+        p2p=status['p2p']
+        if p2p && p2p['channel_id']==channel.id
+          if p2p['local_enabled']
+            txt+="\n"+p_("Conference", "Local P2P: enabled, %{direct}/%{total} participants")%{direct: p2p['recipients'], total: p2p['total_recipients']}
+          else
+            txt+="\n"+p_("Conference", "Local P2P: disabled")
+          end
+        end
+      end
+    end
     @status=txt
       }
       @waitingchannel_hook = Conference.on(:waitingchannel) {

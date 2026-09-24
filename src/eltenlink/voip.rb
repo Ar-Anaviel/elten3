@@ -620,6 +620,11 @@ else
 return 0
 end
 end
+def p2p_status
+transport=@udp_transport
+transport && transport.status
+end
+
 def p2p_allowed?
 return true unless defined?(::EltenAPI::Configuration) && ::EltenAPI::Configuration.respond_to?(:allowp2p)
 ::EltenAPI::Configuration.allowp2p != false

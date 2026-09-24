@@ -2712,6 +2712,7 @@ pc=0
 pc=(curlost.to_f/(curpackets+curlost).to_f)*100.0
 status['curpacketloss']=packetloss
 status['time']=time
+status['p2p']=@voip.p2p_status
 @status_hooks.each{|h|h.call(status)} if @status_hooks!=nil
 end
 def onping(t)
