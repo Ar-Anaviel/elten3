@@ -472,6 +472,7 @@ module EltenLink
       def tick
         return false if closed? || !@tick_mutex.try_lock
         begin
+          @p2p&.update_policy
           now = monotonic
           if now - @last_control_pong > limit(:session_timeout)
             fail_connection(ConnectionError.new("Relay heartbeat timed out"), :connection_lost)
@@ -496,6 +497,12 @@ module EltenLink
 
       def fast_path?
         @udp_registered && monotonic - @last_udp_pong <= limit(:fast_path_timeout)
+      end
+
+      def p2p_allowed?
+        return true unless defined?(::EltenAPI::Configuration) && ::EltenAPI::Configuration.respond_to?(:allowp2p)
+
+        ::EltenAPI::Configuration.allowp2p != false
       end
 
       def p2p_status(session_id)
@@ -532,9 +539,10 @@ module EltenLink
         @control = ssl
         @writer_thread = Thread.new { writer_loop }
         @reader_thread = Thread.new { reader_loop }
+        p2p_enabled = p2p_allowed?
         login = request(
           "login",
-          { "version" => VERSION, "user" => @user, "token" => @token, "app_id" => @app_id, "features" => FEATURES },
+          { "version" => VERSION, "user" => @user, "token" => @token, "app_id" => @app_id, "features" => FEATURES, "p2p_enabled" => p2p_enabled },
           timeout: @timeout
         )
         @client_id = login["client_id"].to_s
@@ -543,7 +551,7 @@ module EltenLink
         @features = Array(login["features"]) & FEATURES
         @server_clock_offset = login["time"].to_f - Time.now.to_f if login["time"]
         if supports?("p2p_v1")
-          @p2p = P2PTransport.new(self, @client_id, @datagram_secret, @host, @port)
+          @p2p = P2PTransport.new(self, @client_id, @datagram_secret, @host, @port, enabled: p2p_enabled)
         end
         start_datagrams
 

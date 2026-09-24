@@ -493,6 +493,7 @@ def make_window
           setting_category(p_("Settings", "Advanced"))
     make_setting(p_("Settings", "Enable FX effects"), :bool, "Advanced", "UseFX")
     make_setting(p_("Settings", "Use bilinear HRTF interpolation"), :bool, "Advanced", "UseBilinearHRTF")
+    make_setting(p_("Settings", "Allow peer-to-peer connections"), :bool, "Advanced", "AllowP2P")
     make_setting(p_("Settings", "Disable concurrent requests (HTTP/2)"), :bool, "Advanced", "DisableHTTP2")
     make_setting(p_("Settings", "Recover responses after request timeout"), [p_("Settings", "Disabled"), p_("Settings", "Mutating requests"), p_("Settings", "All requests")], "Advanced", "RequestResponseCacheMode", ["disabled", "mutating", "all"])
     make_setting(p_("Settings", "Use only TCP packets in conferences"), :bool, "Advanced", "ConferencesTCPOnly")

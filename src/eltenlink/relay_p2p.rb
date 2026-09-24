@@ -16,8 +16,11 @@ module EltenLink
       Peer = Struct.new(:id, :pair_id, :cipher, :addresses, :selected, :last_pong,
                         :rtt, :next_probe, :nonces, :cursor, keyword_init: true)
 
-      def initialize(client, client_id, secret, host, port)
+      def initialize(client, client_id, secret, host, port, enabled: true)
         @client, @host, @port = client, host, port
+        @allowed = @policy_applied = enabled
+        @policy_pending = false
+        @next_policy_update = 0.0
         registration_key = OpenSSL::HMAC.digest("SHA256", secret, "elten-p2p-registration-v1")
         @registration = DatagramCipher.new(client_id, registration_key, role: :client)
         @mutex, @start_mutex = Mutex.new, Mutex.new
@@ -31,6 +34,11 @@ module EltenLink
         @byte_tokens, @packet_tokens, @budget_at = 256 * 1024.0, 100.0, monotonic
         @next_registration = @next_candidates = 0.0
         @last_candidates = nil
+      end
+
+      def update_policy
+        queued = @mutex.synchronize { update_policy_locked }
+        start if queued
       end
 
       def track(snapshot)
@@ -176,6 +184,36 @@ module EltenLink
 
       private
 
+      def enabled?
+        @allowed && @policy_applied == true && @client.p2p_allowed?
+      end
+
+      def update_policy_locked
+        return false if @closed
+
+        allowed = @client.p2p_allowed?
+        if @allowed != allowed
+          @allowed = allowed
+          @policy_applied = nil
+          @sessions.each_value do |session|
+            session[:peers].each_value do |peer|
+              peer.selected = nil
+              peer.last_pong = 0.0
+              peer.nonces.clear
+            end
+          end
+          @assemblies.clear
+          @assembly_bytes = 0
+          @last_candidates = nil
+          @next_registration = @next_candidates = @next_policy_update = 0.0
+        end
+        return false if @allowed == @policy_applied || @policy_pending || monotonic < @next_policy_update
+
+        @policy_pending = true
+        @tasks << [:policy, @allowed]
+        true
+      end
+
       def start
         @start_mutex.synchronize do
           return if @started || @closed
@@ -236,7 +274,7 @@ module EltenLink
       end
 
       def ready?(peer)
-        !@failed && peer && peer.selected && monotonic - peer.last_pong <= PATH_TIMEOUT
+        enabled? && !@failed && peer && peer.selected && monotonic - peer.last_pong <= PATH_TIMEOUT
       end
 
       def fragments(peer, kind, epoch, message_id, envelope)
@@ -248,7 +286,7 @@ module EltenLink
       end
 
       def send_packet(packet, endpoint)
-        return false unless endpoint && packet.bytesize <= @packet_limit
+        return false unless enabled? && endpoint && packet.bytesize <= @packet_limit
         now = monotonic
         elapsed = now - @budget_at
         @budget_at = now
@@ -313,8 +351,9 @@ module EltenLink
       end
 
       def tick_locked
+        update_policy_locked
         now = monotonic
-        active = !@failed && @sessions.values.any? { |session| session[:active] && session[:mode] != "off" }
+        active = enabled? && !@failed && @sessions.values.any? { |session| session[:active] && session[:mode] != "off" }
         if active && @host && now >= @next_registration
           send_packet(REG_MAGIC + @registration.encode("R".b + SecureRandom.random_bytes(8)), [@host, @port])
           @next_registration = now + 3
@@ -328,7 +367,7 @@ module EltenLink
           @next_candidates = now + 10
         end
         @pairs.each_value do |_session_id, peer|
-          next if @failed || peer.next_probe > now
+          next if !enabled? || @failed || peer.next_probe > now
           endpoints = ready?(peer) ? [peer.selected] : peer.addresses.rotate(peer.cursor).first(2)
           peer.cursor = (peer.cursor + 2) % [peer.addresses.length, 1].max
           endpoints.each do |endpoint|
@@ -400,7 +439,7 @@ module EltenLink
 
       def receive(packet, endpoint)
         event = @mutex.synchronize do
-          return if @closed
+          return if @closed || !enabled?
           if packet.byteslice(0, 4) == REG_MAGIC
             return unless endpoint == [@host, @port]
             clear = @registration.decode(packet.byteslice(4..-1))
@@ -486,7 +525,15 @@ module EltenLink
         while (task = @tasks.pop)
           break if @closed
           begin
-            if task[0] == :candidates
+            if task[0] == :policy
+              @client.__send__(:request, "set_p2p_enabled", { "enabled" => task[1] }, pump_events: false)
+              @mutex.synchronize do
+                @policy_applied = task[1]
+                @policy_pending = false
+              end
+            elsif task[0] == :candidates
+              next unless @mutex.synchronize { enabled? }
+
               @client.__send__(:request, "p2p_candidates", { "candidates" => task[1] }, pump_events: false)
             else
               _, key, id, envelope = task
@@ -506,7 +553,12 @@ module EltenLink
               end
             end
           rescue Error
-            if task[0] == :fallback
+            if task[0] == :policy
+              @mutex.synchronize do
+                @policy_pending = false
+                @next_policy_update = monotonic + 1
+              end
+            elsif task[0] == :fallback
               @mutex.synchronize do
                 recipient = @pending[task[1]]&.dig(:recipients, task[2])
                 if recipient
