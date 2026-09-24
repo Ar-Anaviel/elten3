@@ -191,7 +191,7 @@ module EltenAPI
               else
                 false
               end
-        return nil if due != true || $donotdisturb == true
+        return nil if due != true || EltenAPI::UI.notifications_muted?
         [
           type == :voice_and_sound || type == :sound_only,
           (type == :voice_and_sound || type == :voice_only) ? sprintf("%02d:%02d", now.hour, now.min) : nil

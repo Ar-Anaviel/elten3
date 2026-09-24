@@ -1080,11 +1080,11 @@ module EltenAPI
           previous = @lastfeeds == nil ? nil : @lastfeeds[id]
           next if previous != nil && previous.message == current.message && previous.responses == current.responses && previous.likes == current.likes && previous.liked == current.liked && previous.audio_url == current.audio_url
           if previous == nil && @lastfeeds != nil && current.message != "" && mention?(current.message)
-            enqueue_event("func" => "notif", "sound" => "feed_mention") if $donotdisturb != true
+            enqueue_event("func" => "notif", "sound" => "feed_mention") if !EltenAPI::UI.notifications_muted?
           end
           if played == false && previous == nil && @lastfeeds != nil && current.message != ""
             played = true
-            enqueue_event("func" => "notif", "sound" => "feed_update") if $donotdisturb != true && Configuration.disablefeednotifications != true
+            enqueue_event("func" => "notif", "sound" => "feed_update") if !EltenAPI::UI.notifications_muted? && Configuration.disablefeednotifications != true
           end
           changed << current
           current_feeds[id] = current

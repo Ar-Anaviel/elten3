@@ -124,7 +124,7 @@ end
 
              $main_notifications_changed = true
              Session.notifications_update
-             next if presentation.default_suppressed? || $donotdisturb == true
+             next if presentation.default_suppressed? || EltenAPI::UI.notifications_muted?
 
              event = {
                "func" => "notif",
@@ -142,12 +142,12 @@ end
                $main_notifications_changed = true
                Session.notifications_update
              end
-             next if $donotdisturb == true
+             next if EltenAPI::UI.notifications_muted?
              dispatch_notification(d, batch_sounds)
            elsif d['func']=='msg'
              $notification_msg_count=d['msgs'].to_i
             elsif d['func']=='sig'
-              play_sound('right')
+              play_sound('right') unless EltenAPI::UI.notifications_muted?
               if $scene.class.ancestors.include?(Program) and d['appid'].to_s == $scene.class.app_uuid.to_s
                 begin
                   $scene.signaled(d['sender'], JSON.parse(d['packet'].to_s))
@@ -156,8 +156,7 @@ end
                 end
               end
             elsif d['func']=='call_start'
-              call_sound_start(d['ringtone'] || 'ringing')
-              @@call = CallWindow.new(d['call_id'], d['caller'], d['channel'], d['password']) if @@call==nil || @@call.id!=d['call_id']
+              @@call = CallWindow.new(d['call_id'], d['caller'], d['channel'], d['password'], d['ringtone']) if @@call==nil || @@call.id!=d['call_id']
            elsif d['func']=='call_stop'
               call_sound_stop
               missed_call = @@call if @@call != nil && @@call.id == d['call_id'] && !@@call.handled?
@@ -344,6 +343,9 @@ if $agalarm==true and $alarmproc!=true
     play_sound("dialog_close")
     loop_update
     $alarmproc=false
+  end
+  if @@call != nil || (@@missedcalls_window != nil && @@missedcalls_window.active)
+    process_quick_action_hotkeys(only: :donotdisturb)
   end
   if @@call!=nil
   @@call.update
