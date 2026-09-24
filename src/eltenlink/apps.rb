@@ -499,6 +499,10 @@ module EltenLink
         end
       end
 
+      def live_session_transfer_ownership_request(session_id, participant_id, new_owner_id)
+        ["POST", "#{live_session_path(session_id)}/transfer-ownership", { "participant_id" => participant_id, "new_owner_id" => new_owner_id }]
+      end
+
       def live_session_private_request(session_id, participant_id, params)
         ["POST", "#{live_session_path(session_id)}/private-messages", params.merge("participant_id" => participant_id)]
       end

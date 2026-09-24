@@ -26,6 +26,7 @@ module EltenAPI
     class TimeoutError < Error; end
     class SessionClosed < Error; end
     class NotOwner < Error; end
+    class OwnershipTransferUnsupported < Error; end
     class QueueOverflow < Error; end
     class StackPacketTooLarge < Error; end
     class StackFull < Error; end
@@ -514,6 +515,19 @@ module EltenAPI
         @discovery_metadata
       end
 
+      def transfer_ownership(participant_or_id, timeout: 45, cancellation_token: nil)
+        ensure_open!
+        raise NotOwner, "Only the session owner can transfer ownership" unless owner?
+        raise OwnershipTransferUnsupported, "Server does not support transferring ownership" unless @limits["ownership_transfer"] == true
+        new_owner_id = participant_or_id.is_a?(Participant) ? participant_or_id.id : participant_or_id
+        unless new_owner_id.is_a?(String) && new_owner_id.match?(/\A[A-Za-z0-9_-]{16,64}\z/)
+          raise ArgumentError, "Invalid participant identifier"
+        end
+        data = @endpoint.transfer_ownership(self, new_owner_id, timeout: timeout, cancellation_token: cancellation_token)
+        apply_snapshot(data)
+        owner
+      end
+
       def invite_all(users, metadata: {})
         Array(users).map { |user| invite(user, metadata: metadata) }
       end
@@ -833,6 +847,7 @@ module EltenAPI
       def on_message(with_metadata: false, &block); register_message_callback(:message, with_metadata, &block); end
       def on_participant_joined(&block); register_callback(:participant_joined, &block); end
       def on_participant_left(&block); register_callback(:participant_left, &block); end
+      def on_owner_changed(&block); register_callback(:owner_changed, &block); end
       def on_discovery_metadata_changed(&block); register_callback(:discovery_metadata_changed, &block); end
       def on_gap(&block); register_callback(:gap, &block); end
       def on_closed(&block); register_callback(:closed, &block); end
@@ -1103,6 +1118,12 @@ module EltenAPI
             removed || Participant.new(row)
           end
           emit(:participant_left, item, event["reason"].to_s.to_sym)
+        when "owner_changed"
+          previous_owner, new_owner = event.values_at("previous_owner", "new_owner")
+          if previous_owner.is_a?(Hash) && new_owner.is_a?(Hash)
+            emit(:owner_changed, participant(previous_owner["id"]) || Participant.new(previous_owner),
+              participant(new_owner["id"]) || Participant.new(new_owner))
+          end
         when "discovery_metadata_changed"
           emit(:discovery_metadata_changed, LiveSessions.immutable_copy(event["discovery_metadata"])) if event["discovery_metadata"].is_a?(Hash)
         when "gap"
@@ -1423,6 +1444,14 @@ module EltenAPI
         params = { "discovery_metadata" => metadata, "participant_id" => session.participant_id }
         http = EltenLink::Apps.live_session_discovery_request(:update_metadata, params, session_id: session.id)
         request = queue_live_request(session, :update_metadata, params, retries: 0, timeout: timeout, http: http)
+        await_live_request(request, cancellation_token: cancellation_token)
+      end
+
+      def transfer_ownership(session, new_owner_id, timeout: 45, cancellation_token: nil)
+        ensure_session!(session)
+        params = { "new_owner_id" => new_owner_id, "participant_id" => session.participant_id }
+        http = EltenLink::Apps.live_session_transfer_ownership_request(session.id, session.participant_id, new_owner_id)
+        request = queue_live_request(session, :transfer_ownership, params, retries: 0, timeout: timeout, http: http)
         await_live_request(request, cancellation_token: cancellation_token)
       end
 
