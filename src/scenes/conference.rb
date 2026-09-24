@@ -644,6 +644,14 @@ chk_hidden = CheckBox.new(p_("Conference", "Make this channel hidden"), checked:
     btn_create = Button.new(p_("Conference", "Create")),
     btn_cancel = Button.new(p_("Conference", "Cancel"))
     ], index: 0, silent: false, quiet: true)
+    chk_p2p.on(:change) {
+      if chk_p2p.checked
+        form.show(edt_p2p_limit)
+      else
+        form.hide(edt_p2p_limit)
+      end
+    }
+    chk_p2p.trigger(:change)
     chk_permanent.on(:change) {
     if !holds_premiumpackage("director") && !requires_premiumpackage("audiophile")
     chk_permanent.checked = channel.permanent
@@ -743,7 +751,9 @@ chk_hidden = CheckBox.new(p_("Conference", "Make this channel hidden"), checked:
     btn_create.on(:press) {
     suc=true
     suc=false if edt_name.text==""
-    if suc && (!edt_p2p_limit.text.match?(/\A[0-9]+\z/) || edt_p2p_limit.text.to_i>0x7fffffff)
+    p2p_limit_valid=edt_p2p_limit.text.match?(/\A[0-9]+\z/) && edt_p2p_limit.text.to_i<=0x7fffffff
+    p2p_limit=p2p_limit_valid ? edt_p2p_limit.text.to_i : channel.p2p_participants_limit
+    if suc && chk_p2p.checked && !p2p_limit_valid
       alert(p_("Conference", "Enter a non-negative P2P participant limit"))
       suc=false
     end
@@ -790,9 +800,9 @@ when 1
       key_len=0
 end
       if channel.id==0
-      Conference.create(name, public, bitrate, framesize, vbr_type, codec_application, prediction_disabled, fec, password, spatialization, channels, lang, width, height, key_len, waiting_type, permanent, motd, allow_guests, conference_mode, blacklist_policy, chk_p2p.checked, edt_p2p_limit.text.to_i)
+      Conference.create(name, public, bitrate, framesize, vbr_type, codec_application, prediction_disabled, fec, password, spatialization, channels, lang, width, height, key_len, waiting_type, permanent, motd, allow_guests, conference_mode, blacklist_policy, chk_p2p.checked, p2p_limit)
     else
-      Conference.edit(channel.id, name, public, bitrate, framesize, vbr_type, codec_application, prediction_disabled, fec, password, spatialization, channels, lang, width, height, key_len, waiting_type, permanent, motd, allow_guests, conference_mode, blacklist_policy, chk_p2p.checked, edt_p2p_limit.text.to_i)
+      Conference.edit(channel.id, name, public, bitrate, framesize, vbr_type, codec_application, prediction_disabled, fec, password, spatialization, channels, lang, width, height, key_len, waiting_type, permanent, motd, allow_guests, conference_mode, blacklist_policy, chk_p2p.checked, p2p_limit)
       end
       form.resume
       end
