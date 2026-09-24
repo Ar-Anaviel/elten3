@@ -13,6 +13,7 @@ require "thread"
 require "zlib"
 
 require_relative "../eapi/conferencenative"
+require_relative "voip_udp"
 
 module EltenLink
 
@@ -55,6 +56,7 @@ def initialize
 @key = OpenSSL::PKey::RSA.new(2048)
 @tcp=nil
 @udp=nil
+@udp_transport=nil
 @uid=nil
 @secret=nil
 @chid=0
@@ -63,6 +65,7 @@ def initialize
 @cipher=OpenSSL::Cipher::AES256.new :CTR
 @channel_secrets=[]
 @received={}
+@receive_mutex=Mutex.new
 @pings={}
 @tcp_mutex = Mutex.new
 @update_mutex = Mutex.new
@@ -125,10 +128,12 @@ encodings = ['deflate', 'zstd']
 encodings.push('xz') if defined?(XZ_AVAILABLE) && XZ_AVAILABLE
 command("session_encodings", {'encodings'=>encodings}, reconnect: false)
 command("session_aliasversion", {'version'=>1}, reconnect: false)
-resp=command("login", {'login'=>username, 'token'=>token, 'publickey'=>Base64.strict_encode64(@key.public_key.to_der)}, reconnect: false)
+resp=command("login", {'login'=>username, 'token'=>token, 'publickey'=>Base64.strict_encode64(@key.public_key.to_der), 'udp_p2p_v1'=>true}, reconnect: false)
 if resp!=false
 @uid=resp['id']
 @secret=Base64.strict_decode64(resp['secret'])
+raise IOError, "UDP negotiation failed" unless resp['udp_p2p_v1'].is_a?(Hash)
+@udp_transport=UDPTransport.new(self, resp['udp_p2p_v1'], ConferenceHost, 8133)
 stop_transport_thread(@tcpthread)
 @tcpthread=Thread.new {
 until @closing
@@ -207,7 +212,8 @@ end
 def update
 @update_mutex.synchronize {
 send(200, "")
-resp=command("update")
+requested_at=Process.clock_gettime(Process::CLOCK_MONOTONIC)
+resp=command("update", @udp_transport ? @udp_transport.update_params : {})
 if resp.is_a?(Hash) && resp['updated']
 log(-1, "Conference: updating parameters")
 @chid=resp['channel']
@@ -217,14 +223,19 @@ log(-1, "Conference: updating parameters")
 @cur_lostpackets=0
 @index=1
 @channel_secrets[@stamp]=Base64.strict_decode64(resp['channel_secret']) if resp['channel_secret']!=nil
-@received={}
+@receive_mutex.synchronize { @received={} }
 if resp['params']!=nil
 @params_queue << resp['params']
 end
 end
+@udp_transport.configure(resp['udp'], requested_at) if @udp_transport && resp.is_a?(Hash)
 if resp.is_a?(Hash) && resp['packets'].is_a?(Array)
 for data in resp['packets'].map{|pc|Base64.decode64(pc)}
+if @udp_transport
+@udp_transport.receive(data)
+else
 receive(data)
+end
 end
 end
 }
@@ -252,6 +263,7 @@ rescue Exception
 end
 stop_transport_thread(udpthread)
 stop_transport_thread(tcpthread)
+@udp_transport=nil
 @connected=false
 end
 def stop_transport_thread(thread)
@@ -347,7 +359,7 @@ end
 if userid==nil
 userid=@uid
 end
-bytes=[uid%256, uid/256, @stamp%256, (@stamp/256)%256, @stamp/256/256, index%256, index/256, type, p1, p2, p3, p4, crc%256, (crc/256)%256, (crc/256/256)%256, crc/256/256/256]
+bytes=[userid%256, userid/256, @stamp%256, (@stamp/256)%256, @stamp/256/256, index%256, index/256, type, p1, p2, p3, p4, crc%256, (crc/256)%256, (crc/256/256)%256, crc/256/256/256]
 data=bytes.pack("C*")
 @cipher_mutex.synchronize {
 if message!=""
@@ -384,6 +396,7 @@ end
 def send_packet(data)
 return false if data==nil
 @sendtimes[@index-1]=Time.now.to_f
+return @udp_transport.send(data) if @udp_transport
 @sendbytes+=data.bytesize
 if !@tcp_requested
 @udp.send(data, 0, "conferencing.elten.link", 8133)
@@ -410,7 +423,7 @@ for pc in packets
 if pc.size>2
 m=generate_packet(pc[0], pc[1], pc[2]||0, pc[3]||0, pc[4]||0, pc[5]||0, pc[6]||nil, pc[7]||nil, pc[8]||false)
 if m!=nil
-if 16+coll.map{|c|c.bytesize+4}.sum+4+m.bytesize>($udpmaxpacketsize||1400) || coll.size>16
+if 16+coll.map{|c|c.bytesize+4}.sum+4+m.bytesize>[(($udpmaxpacketsize||1400)-(@udp_transport ? @udp_transport.reserve : 0)), 256].max || coll.size>16
 send_coll(coll)
 coll.clear
 end
@@ -436,8 +449,8 @@ def on_ping(&block)
 end
 def mute(user)
 log(-1, "Conference: muting user #{user}")
-command("mute", {'user'=>user})
 @mutes.push(user) if !@mutes.include?(user)
+command("mute", {'user'=>user})
 end
 def unmute(user)
 log(-1, "Conference: unmuting user #{user}")
@@ -446,8 +459,8 @@ command("unmute", {'user'=>user})
 end
 def chat_mute(user)
 log(-1, "Conference: muting chat of user #{user}")
-command("chat_mute", {'user'=>user})
 @chat_mutes.push(user) if !@chat_mutes.include?(user)
+command("chat_mute", {'user'=>user})
 end
 def chat_unmute(user)
 log(-1, "Conference: unmuting chat of user #{user}")
@@ -456,8 +469,8 @@ command("chat_unmute", {'user'=>user})
 end
 def streams_mute(user)
 log(-1, "Conference: muting streams of user #{user}")
-command("streams_mute", {'user'=>user})
 @streams_mutes.push(user) if !@streams_mutes.include?(user)
+command("streams_mute", {'user'=>user})
 end
 def streams_unmute(user)
 log(-1, "Conference: unmuting streams of user #{user}")
@@ -466,8 +479,8 @@ command("streams_unmute", {'user'=>user})
 end
 def streamid_mute(id)
 log(-1, "Conference: muting stream #{id}")
-command("streamid_mute", {'stream'=>id})
 @streamid_mutes.push(id) if !@streamid_mutes.include?(id)
+command("streamid_mute", {'stream'=>id})
 end
 def streamid_unmute(id)
 log(-1, "Conference: unmuting stream #{id}")
@@ -607,33 +620,77 @@ else
 return 0
 end
 end
+def p2p_allowed?
+return true unless defined?(::EltenAPI::Configuration) && ::EltenAPI::Configuration.respond_to?(:allowp2p)
+::EltenAPI::Configuration.allowp2p != false
+end
 private
+def udp_port
+@udp.addr[1]
+end
+def send_udp_packet(data, endpoint)
+return false unless @udp && !@udp.closed?
+sent=@udp.sendmsg_nonblock(data, 0, Socket.sockaddr_in(endpoint[1], endpoint[0]), exception: false)
+@sendbytes+=data.bytesize if sent==data.bytesize
+sent==data.bytesize
+rescue IOError, SystemCallError, SocketError
+false
+end
+def send_relay_packet(data)
+if @udp_transport.server_ready? && data.bytesize<=($udpmaxpacketsize||1400)
+return true if send_udp_packet(data, @udp_transport.server)
+end
+@sendbytes+=data.bytesize
+command("packet", {'packet'=>Base64.strict_encode64(data)})!=false
+end
+def packet_muted?(username, type, streamid)
+case type
+when 1
+@mutes.include?(username)
+when 2, 101, 111, 112, 113, 114
+@chat_mutes.include?(username)
+when 21
+@streams_mutes.include?(username) || @streamid_mutes.include?(streamid)
+else
+false
+end
+end
 def connect_udp
 log(0, "Conference: connecting to server")
 stop_transport_thread(@udpthread)
 @udp=UDPSocket.new()
 @udp.setsockopt(Socket::SOL_SOCKET, Socket::SO_RCVBUF, 16777216)
 @udp.setsockopt(Socket::SOL_SOCKET, Socket::SO_SNDBUF, 16777216)
+@udp.bind("0.0.0.0", 0)
+if @udp_transport
+@udp_transport.tick
+else
 @sendbytes+=@secret.bytesize
-@udp.send(@secret, 0, "conferencing.elten.link", 8133)
+@udp.send(@secret, 0, ConferenceHost, 8133)
+end
 lasttime = Time.now.to_f
 @udpthread = Thread.new {
 until @closing
 begin
-data, addr = @udp.recvfrom_nonblock(1500)
-lasttime=Time.now.to_f
+@udp_transport.tick if @udp_transport
+data, addr = @udp.recvfrom_nonblock(32768+1024)
 @receivedbytes+=data.bytesize
+if @udp_transport
+lasttime=Time.now.to_f if @udp_transport.receive(data, [addr[3], addr[1]])==:server
+else
+lasttime=Time.now.to_f
 receive(data)
+end
 rescue IO::EWOULDBLOCKWaitReadable
-@reconnect_thread = Thread.new{reconnect} if !@closing && @reconnecting==false && (Time.now.to_f-lasttime>15 && @tcp_requested==false)
+@reconnect_thread = Thread.new{reconnect} if !@closing && @reconnecting==false && (Time.now.to_f-lasttime>15 && @tcp_requested==false && !@udp_transport)
 IO.select([@udp], nil, nil, 0.1)
 retry
 rescue IO::EWOULDBLOCKWaitWritable
-@reconnect_thread = Thread.new{reconnect} if !@closing && @reconnecting==false && (Time.now.to_f-lasttime>15 && @tcp_requested==false)
+@reconnect_thread = Thread.new{reconnect} if !@closing && @reconnecting==false && (Time.now.to_f-lasttime>15 && @tcp_requested==false && !@udp_transport)
 IO.select(nil, [@udp], nil, 0.1)
 retry
 rescue Exception
-@reconnect_thread = Thread.new{reconnect} if !@closing && @reconnecting==false && (Time.now.to_f-lasttime>15 && @tcp_requested==false)
+@reconnect_thread = Thread.new{reconnect} if !@closing && @reconnecting==false && (Time.now.to_f-lasttime>15 && @tcp_requested==false && !@udp_transport)
 log(2, "VoIP UDP: "+$!.to_s+" "+$@.to_s) if !@closing
 end
 end
@@ -649,8 +706,10 @@ end
 def receive(data)
 receiveTime=Time.now
 data=(data+"").b
+return if data.bytesize<16
 userid, stamp, index, type = extract(data)
 return if type<200 && @chid==0
+@receive_mutex.synchronize {
 @received[userid]||={}
 @cur_rx_packets+=1
 if index>10
@@ -660,6 +719,7 @@ end
 @received[userid][type]||=[]
 return if type<200 && (userid!=0 && (@received[userid][type]||[]).include?(index))
 @received[userid][type].push(index) if userid!=0
+}
 message = ""
 crc=data.getbyte(12)+data.getbyte(13)*256+data.getbyte(14)*256**2+data.getbyte(15)*256**3
 p1=data.getbyte(8)
