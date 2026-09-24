@@ -55,7 +55,7 @@ end
 }
     end
     def wait
-      if @updated==true || @quiet==true
+      if @announce_wait!=false && (@updated==true || @quiet==true)
       @playmarker=false
             play_sound("form_marker")
       focus
@@ -69,6 +69,17 @@ end
     def resume
       @wait=false
       loop_update
+    end
+    def resume_for_refresh
+      @wait=false
+    end
+    def wait_without_announcement
+      previous=@announce_wait
+      @announce_wait=false
+      @playmarker=false
+      wait
+    ensure
+      @announce_wait=previous
     end
     def disable_menu
       @disable_menu=true
@@ -225,12 +236,13 @@ class FormTimer
             end
           super
           if $focus==true
-            focus
+            focus if @fields[@index]!=nil && @hidden[@index]!=true
             $focus=false
             end
           @index-=1 while (@fields[@index]==nil or @hidden[@index]==true) and @index>0
       @index+=1 while (@fields[@index]==nil or @hidden[@index]==true) and @index<@fields.size-1
                 oldindex=@index
+      if @fields[@index]!=nil && @hidden[@index]!=true
       if key_pressed?(0x09) == true
                                         speech_stop
             if key_held?(0x10) == false and @fields[@index].subindex==@fields[@index].maxsubindex
@@ -285,6 +297,7 @@ ind=@index
         else
                     @fields[@index].update
                   end
+      end
                   if key_pressed?(:key_escape) && @cancel_button.is_a?(Button)
                     @cancel_button.press
                   end
@@ -324,6 +337,39 @@ def delete_timer(timer)
                   f=@fields.index(sfield)||-2
                   @fields.insert(f+1, field)
                   end
+
+def replace_fields(fields, fallback: :nearest)
+  raise ArgumentError, "fallback must be :nearest or :first" unless [:nearest, :first].include?(fallback)
+  unless fields.is_a?(Array) && fields.all? { |field| field.nil? || field.is_a?(FormBase) }
+    raise ArgumentError, "fields must contain controls or nil"
+  end
+  hidden={}.compare_by_identity
+  @fields.each_with_index { |field, index| hidden[field]=@hidden[index]==true if !field.nil? }
+  current=@fields[@index]
+  new_hidden=fields.map { |field| hidden[field]==true }
+  available=fields.each_index.select { |index| !fields[index].nil? && !new_hidden[index] }
+  index=available.find { |index| fields[index].equal?(current) }
+  index||=if fallback==:first
+    available.first
+  else
+    available.min_by { |index| [(index-@index.to_i).abs, -index] }
+  end
+  target=index==nil ? nil : fields[index]
+  @fields.replace(fields)
+  @hidden.replace(new_hidden)
+  @index=index || 0
+  unless current.equal?(target)
+    if !current.nil?
+      current.trigger(:blur)
+      current.blur
+    end
+    if !target.nil?
+      focus
+      trigger(:move, @index)
+    end
+  end
+  self
+end
 
                 def index=(ind)
                   ind=@fields.find_index(ind) if ind.is_a?(FormBase)
