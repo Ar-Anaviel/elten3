@@ -95,7 +95,7 @@ module GlobalMenu
     for prg in list
       m.scene(prg.menu_label||prg.name||prg.to_s, prg)
       end
-    m.scene(p_("MainMenu", "Programs management"), Scene_Programs)
+    m.scene(p_("MainMenu", "Program centre"), Scene_Programs)
     }
     @menu.submenu(p_("MainMenu", "&Tools")) {|m|
     m.scene(p_("MainMenu", "Program &settings"), Scene_Settings)
