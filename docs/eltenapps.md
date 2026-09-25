@@ -430,6 +430,12 @@ SERVER_TABLES = {
       "points" => "int",
       "level" => "int"
     }
+  },
+  "games" => {
+    "visibility" => "public",
+    "columns" => { "mode" => "string:32" },
+    "filtered_columns" => ["__insertion_user", "__last_update_user"],
+    "filter_for" => "others"
   }
 }.freeze
 
@@ -440,6 +446,8 @@ server_app(
   notifications: true
 )
 ```
+
+Use `"filter_for" => "everyone"` to hide the listed columns in your own rows as well.
 
 `server_table("scores")`, `server_resources` and `delete_server_app` then use the declared UUID unless an explicit UUID is passed. `update_server_schema!` updates the declared tables and protection setting. The existing argument-based helpers remain available for applications which manage their server registration themselves.
 
