@@ -16,11 +16,8 @@ module EltenAPI
   module TimeSource
     class << self
       def current_time
-        tm = nil
-        tm = NotificationService.server_time
-        tm = $wnlasttime if tm == nil && $wnlasttime != nil
-        tm = Time.now.to_i if Configuration.synctime == false || tm == nil
-        Time.at(tm)
+        return Time.now if Configuration.synctime == false
+        ServerClock.now || Time.now
       rescue Exception
         Time.now
       end

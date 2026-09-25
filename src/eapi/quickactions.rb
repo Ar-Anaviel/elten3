@@ -52,13 +52,9 @@ module EltenAPI
         alert(_("Error"), false)
       end
       def gettime
-        if Configuration.synctime == true
-          time = EltenLink::System.server_time(EltenLink.client(self))
-                    else
-                                            time=Time.now
-                                          end
-                                          return time
-        end
+        return Time.now unless Configuration.synctime == true
+        ServerClock.now || raise(EltenLink::Error.new("Server clock is not synchronized", code: "system.clock_unavailable"))
+      end
       def call_symbol
         case @action
         when :whatsnew

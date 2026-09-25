@@ -218,6 +218,7 @@ src/ui/controls/opus_record_button.rb
 src/ui/controls/date_button.rb
 src/ui/controls/__controls.rb
 src/eapi/tasks.rb
+src/eapi/server_clock.rb
 src/eapi/communication.rb
 src/eapi/live_sessions.rb
 src/eapi/dictionary.rb

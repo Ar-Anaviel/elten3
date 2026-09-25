@@ -443,7 +443,8 @@ module EltenAPI
       end
 
       def expired?
-        @expires_at.positive? && Time.now.to_i >= @expires_at
+        now = ServerClock.now
+        @expires_at.positive? && now != nil && now.to_i >= @expires_at
       end
     end
 
@@ -1814,10 +1815,11 @@ module EltenAPI
       end
 
       def expire_invitations
-        now = Time.now.to_i
+        now = ServerClock.now&.to_i
+        local_time = Time.now.to_i
         @mutex.synchronize do
-          @invitations.delete_if { |_id, invitation| invitation.expires_at.positive? && invitation.expires_at <= now }
-          @resolved_invitations.delete_if { |_id, entry| entry[:at] < now - 300 }
+          @invitations.delete_if { |_id, invitation| now != nil && invitation.expires_at.positive? && invitation.expires_at <= now }
+          @resolved_invitations.delete_if { |_id, entry| entry[:at] < local_time - 300 }
         end
       end
 
@@ -2218,9 +2220,9 @@ module EltenAPI
       end
 
       def cleanup_pending
-        now = Time.now.to_i
+        now = ServerClock.now&.to_i
         pending.delete_if do |_appid, bucket|
-          bucket.delete_if { |_id, row| row["expires_at"].to_i.positive? && row["expires_at"].to_i <= now }
+          bucket.delete_if { |_id, row| now != nil && row["expires_at"].to_i.positive? && row["expires_at"].to_i <= now }
           bucket.empty?
         end
       end

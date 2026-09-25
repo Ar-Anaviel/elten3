@@ -77,6 +77,7 @@ module EltenAPI
         ensure_state
         return true if @thread != nil && @thread.alive?
         @stopped = false
+        ServerClock.__send__(:start)
         @thread = Thread.new { worker_loop }
         @thread.report_on_exception = false
         true
@@ -85,6 +86,7 @@ module EltenAPI
       def stop
         ensure_state
         @stopped = true
+        ServerClock.__send__(:stop)
         stop_stream
         cancel_status_requests
       end
@@ -263,6 +265,7 @@ module EltenAPI
           break if @stopped == true
           begin
             key = session_key
+            ServerClock.__send__(:update, key)
             if key == nil
               reset_session(nil)
               clear_responses
@@ -274,6 +277,7 @@ module EltenAPI
               reset_session(key) if @session_key != key
               now = monotonic_time
               reconcile_notification_apps(now)
+              expire_active_notifications(now)
               http2_enabled = reconcile_realtime_transport(now)
               drain_responses
               drain_stream_responses
@@ -326,6 +330,7 @@ module EltenAPI
         enqueue_event("func" => "call_stop", "call_id" => @call_id, "caller" => @call_caller) if @ringingplaying == true || @call_id != nil
         @session_key = key
         @wnlasttime = nil
+        @next_notification_expiration_at = 0.0
         @ag_msg = nil
         @ag_feed = 0
         @ag_feedtime = 0
@@ -1303,13 +1308,24 @@ module EltenAPI
         true
       end
 
+      def expire_active_notifications(now)
+        return if now < @next_notification_expiration_at.to_f || !ServerClock.synchronized?
+        @next_notification_expiration_at = now + 1.0
+        changed = @active_notifications_mutex.synchronize do
+          previous = @active_notifications.size
+          @active_notifications = normalize_active_notifications(@active_notifications)
+          previous != @active_notifications.size
+        end
+        enqueue_event("func" => "notifications") if changed
+      end
+
       def normalize_active_notifications(notifications)
-        now = Time.now.to_i
+        now = ServerClock.now&.to_i
         allowed_apps = Array(@notification_apps)
         notifications.to_a.each_with_object({}) do |notification, result|
           next unless notification.is_a?(EltenLink::Notification)
           next if notification.id.to_i <= 0 || notification.revoked == true
-          next if notification.expiration.to_i > 0 && notification.date.to_i + notification.expiration.to_i < now
+          next if now != nil && notification.expiration.to_i > 0 && notification.date.to_i + notification.expiration.to_i < now
           next if !notification.app_uuid.to_s.empty? && !allowed_apps.include?(notification.app_uuid.to_s.downcase)
 
           result[notification.id.to_i] = notification
