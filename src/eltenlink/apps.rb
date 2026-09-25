@@ -17,7 +17,7 @@ module EltenLink
   class AppPackage
     attr_accessor :id, :size, :version, :build_id, :elten_api_version, :eltenlink_contract_version,
       :author, :owner, :path, :url, :original_filename, :recommended, :creation_time, :update_time,
-      :verified, :platforms, :metadata
+      :verified, :platforms, :metadata, :active_installations
     attr_reader :realpath, :raw_name, :raw_description, :localized_names, :localized_descriptions,
       :name_languages, :description_languages, :main_language, :supported_languages
 
@@ -26,7 +26,7 @@ module EltenLink
       raw_name: nil, raw_description: nil, localized_names: {}, localized_descriptions: {},
       main_language: "unknown", supported_languages: [], owner: "", original_filename: "",
       supported_languages_declared: nil, recommended: false, creation_time: 0, update_time: 0,
-      verified: false, platforms: [], metadata: {})
+      verified: false, platforms: [], metadata: {}, active_installations: nil)
       @id = id.to_s
       @path = path
       @raw_name = (raw_name.nil? ? name : raw_name).to_s
@@ -60,6 +60,7 @@ module EltenLink
       @verified = verified == true || verified.to_s == "1" || verified.to_s.casecmp?("true")
       @creation_time = creation_time.to_i
       @update_time = update_time.to_i
+      @active_installations = active_installations.nil? ? nil : active_installations.to_i
       @platforms = Array(platforms).map(&:to_s)
     end
 
@@ -437,6 +438,7 @@ module EltenLink
           verified: row["verified"],
           creation_time: row["creation_time"],
           update_time: row["update_time"],
+          active_installations: row["active_installations"],
           platforms: row["platforms"] || metadata["platforms"] || [],
           metadata: metadata
         )
