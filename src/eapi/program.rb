@@ -3436,7 +3436,7 @@ class Program
       uuid
     end
 
-    def update_server_app(uuid = nil, name: nil, data: nil, tables: nil, tables_protected: nil, notifications: nil, max_public_resources_bytes: nil, max_private_resources_bytes_per_user: nil)
+    def update_server_app(uuid = nil, name: nil, data: nil, tables: nil, tables_protected: nil, notifications: nil, max_public_resources_bytes: nil, max_private_resources_bytes_per_user: nil, expected_schema_revision: nil)
       EltenLink::Apps.update(
         EltenLink.client(self),
         uuid || app_uuid,
@@ -3446,11 +3446,40 @@ class Program
         :tables_protected => tables_protected,
         :notifications => notifications,
         max_public_resources_bytes: max_public_resources_bytes,
+        max_private_resources_bytes_per_user: max_private_resources_bytes_per_user,
+        expected_schema_revision: expected_schema_revision
+      )
+    end
+
+    def preview_server_app_update(uuid = nil, name: nil, data: nil, tables: nil, tables_protected: nil, notifications: nil, max_public_resources_bytes: nil, max_private_resources_bytes_per_user: nil)
+      EltenLink::Apps.preview_update(
+        EltenLink.client(self),
+        uuid || app_uuid,
+        name: name || self.name,
+        data: data,
+        tables: tables,
+        tables_protected: tables_protected,
+        notifications: notifications,
+        max_public_resources_bytes: max_public_resources_bytes,
         max_private_resources_bytes_per_user: max_private_resources_bytes_per_user
       )
     end
 
-    def update_server_schema!
+    def preview_server_schema
+      definition = required_server_app_definition
+      raise Programs::ProgramError, "Server application UUID is not set" if definition.uuid == nil
+
+      preview_server_app_update(
+        definition.uuid,
+        tables: definition.tables,
+        tables_protected: definition.protected?,
+        notifications: definition.notifications?,
+        max_public_resources_bytes: definition.max_public_resources_bytes,
+        max_private_resources_bytes_per_user: definition.max_private_resources_bytes_per_user
+      )
+    end
+
+    def update_server_schema!(expected_schema_revision: nil)
       definition = required_server_app_definition
       raise Programs::ProgramError, "Server application UUID is not set" if definition.uuid == nil
 
@@ -3460,7 +3489,8 @@ class Program
         tables_protected: definition.protected?,
         notifications: definition.notifications?,
         max_public_resources_bytes: definition.max_public_resources_bytes,
-        max_private_resources_bytes_per_user: definition.max_private_resources_bytes_per_user
+        max_private_resources_bytes_per_user: definition.max_private_resources_bytes_per_user,
+        expected_schema_revision: expected_schema_revision
       )
     end
 

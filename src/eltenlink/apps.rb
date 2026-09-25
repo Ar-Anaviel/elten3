@@ -614,7 +614,20 @@ module EltenLink
         data.dig("app", "uuid").to_s
       end
 
-      def update(client, uuid, name: nil, data: nil, tables: nil, tables_protected: nil, notifications: nil, max_public_resources_bytes: nil, max_private_resources_bytes_per_user: nil)
+      def update(client, uuid, name: nil, data: nil, tables: nil, tables_protected: nil, notifications: nil, max_public_resources_bytes: nil, max_private_resources_bytes_per_user: nil, expected_schema_revision: nil)
+        params = app_update_params(name: name, data: data, tables: tables, tables_protected: tables_protected,
+          notifications: notifications, max_public_resources_bytes: max_public_resources_bytes,
+          max_private_resources_bytes_per_user: max_private_resources_bytes_per_user, expected_schema_revision: expected_schema_revision)
+        data = client.api_data("PUT", "/api/v1/apps/#{query_escape(uuid)}", params)
+        data["app"]
+      end
+
+      def preview_update(client, uuid, **options)
+        data = client.api_data("POST", "/api/v1/apps/#{query_escape(uuid)}/schema/preview", app_update_params(**options))
+        data.fetch("preview")
+      end
+
+      def app_update_params(name: nil, data: nil, tables: nil, tables_protected: nil, notifications: nil, max_public_resources_bytes: nil, max_private_resources_bytes_per_user: nil, expected_schema_revision: nil)
         params = {}
         params["name"] = name.to_s if name != nil
         params["data"] = data if data != nil
@@ -623,9 +636,10 @@ module EltenLink
         params["notifications"] = notifications == true || notifications.to_s == "1" || notifications.to_s.downcase == "true" if notifications != nil
         params["max_public_resources_bytes"] = max_public_resources_bytes unless max_public_resources_bytes.nil?
         params["max_private_resources_bytes_per_user"] = max_private_resources_bytes_per_user unless max_private_resources_bytes_per_user.nil?
-        data = client.api_data("PUT", "/api/v1/apps/#{query_escape(uuid)}", params)
-        data["app"]
+        params["expected_schema_revision"] = expected_schema_revision unless expected_schema_revision.nil?
+        params
       end
+      private :app_update_params
 
       def info(client, uuid)
         data = client.api_data("GET", "/api/v1/apps/#{query_escape(uuid)}")
