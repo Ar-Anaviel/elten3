@@ -583,7 +583,7 @@ module Programs
 
   class Manifest
     attr_reader :id, :raw_name, :raw_description, :version, :build_id, :elten_api_version, :eltenlink_contract_version, :author, :main, :main_class, :platforms, :menu, :gems, :required_assets, :execution, :raw,
-      :localized_names, :localized_descriptions, :name_languages, :description_languages, :main_language, :supported_languages
+      :localized_names, :localized_descriptions, :name_languages, :description_languages, :main_language, :supported_languages, :sources_default_encoding
 
     def initialize(raw, source)
       @raw = raw.is_a?(Hash) ? raw : {}
@@ -603,6 +603,7 @@ module Programs
       @gems = Array(@raw["gems"]).map { |gem| gem.is_a?(Hash) ? gem["name"].to_s : gem.to_s }.reject { |gem| gem == "" }
       @required_assets = normalize_required_assets(@raw["required_assets"])
       @execution = Execution::Spec.new(@raw["execution"], @source)
+      @sources_default_encoding = Programs::ProgramPackageMetadata.normalize_sources_default_encoding(@raw["sources_default_encoding"])
       @main_language = normalize_main_language(@raw["main_language"])
       @supported_languages_declared = @raw.key?("supported_languages")
       @supported_languages = normalize_supported_languages(@raw["supported_languages"])
@@ -1144,6 +1145,8 @@ module Programs
       return false if @loaded[logical]
       code = code_for(logical)
       raise ProgramError, "Cannot load missing program file #{logical}" if code == nil
+      encoding = @manifest.sources_default_encoding
+      code = code.dup.force_encoding(encoding) if encoding != nil
       @loaded[logical] = true
       Programs.with_runtime(self) { @execution.evaluate(code, virtual_path(logical), 1) }
       true
